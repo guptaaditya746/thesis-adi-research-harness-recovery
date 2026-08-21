@@ -1,0 +1,38 @@
+# Dependencies and generated builds
+**/node_modules/
+**/.next/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+
+# Runtime corpus, durable runs, uploads, and immutable artifacts
+backend/data/
+backend/**/artifacts/
+backend/**/harness_steps/
+backend/**/workspace/
+backend/**/*.sqlite3
+backend/**/*.db
+backend/**/*.pdf
+backend/**/page_*.txt
+
+# Local environment, logs, and editor/OS noise
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+.DS_Store
+.idea/
+.vscode/
+
+# Packaging and tool caches
+**/.turbo/
+**/.cache/
+**/dist/
+**/build/
+**/*.egg-info/

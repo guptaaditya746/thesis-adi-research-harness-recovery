@@ -24,6 +24,11 @@ def stable_hash(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+SpecialistCapability = Literal[
+    "documents", "ontology", "sparql", "edc", "verification",
+    "entity_normalization", "artifacts", "shell", "filesystem",
+]
+
 
 class ModelProfile(StrEnum):
     FAST = "fast"
@@ -83,7 +88,7 @@ class AgentSpec(BaseModel):
     role: str
     objective: str
     instructions: str
-    required_capabilities: list[str] = Field(default_factory=list)
+    required_capabilities: list[SpecialistCapability] = Field(default_factory=list)
     input_artifact_ids: list[str] = Field(default_factory=list)
     output_schema: str = "specialist_result"
     model_profile: ModelProfile = ModelProfile.BALANCED

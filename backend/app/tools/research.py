@@ -16,6 +16,27 @@ from app.models.domain import (
 
 def register_research_tools(agent) -> None:
     """Small meta-capability surface for the long-lived Research Director."""
+    def validate_specialist_spec(ctx: RunContext[HarnessDeps], spec: AgentSpec) -> None:
+        unknown = sorted(set(spec.required_capabilities) - set(SUPPORTED_CAPABILITIES))
+        if unknown:
+            raise ValueError(
+                "Unknown specialist capabilities: " + ", ".join(unknown)
+                + ". Valid capabilities are: " + ", ".join(sorted(SUPPORTED_CAPABILITIES))
+                + ". Artifact kinds such as evidence_span are not capabilities."
+            )
+        missing = []
+        for artifact_id in spec.input_artifact_ids:
+            try:
+                ctx.deps.artifacts.get(artifact_id)
+            except KeyError:
+                missing.append(artifact_id)
+        if missing:
+            raise ValueError(
+                "AgentSpec.input_artifact_ids must contain persisted ArtifactStore IDs. "
+                f"These IDs do not resolve: {missing}. IDs returned by orientation_search_documents "
+                "are retrieval candidates, not artifacts; delegate with the documents capability first."
+            )
+
 
     @agent.tool
     async def available_research_capabilities(ctx: RunContext[HarnessDeps]) -> dict:
@@ -113,20 +134,27 @@ def register_research_tools(agent) -> None:
     @agent.tool
     async def spawn_specialist(ctx: RunContext[HarnessDeps], spec: AgentSpec) -> dict:
         """Create one isolated ephemeral PydanticAI specialist from this runtime-generated AgentSpec."""
+        ctx.deps.ensure_not_cancelled()
+        validate_specialist_spec(ctx, spec)
         output = await AgentFactory(ctx.deps).run(spec)
         return output.model_dump(mode="json")
 
     @agent.tool
     async def run_specialist_fanout(ctx: RunContext[HarnessDeps], specs: list[AgentSpec]) -> list[dict]:
         """Dynamically fan out independent specialists; each receives isolated context/toolsets."""
+        ctx.deps.ensure_not_cancelled()
+        for spec in specs:
+            validate_specialist_spec(ctx, spec)
         outputs = await AgentFactory(ctx.deps).run_fanout(specs)
         return [x.model_dump(mode="json") for x in outputs]
 
     @agent.tool
     async def run_dynamic_workflow(ctx: RunContext[HarnessDeps], specs: list[AgentSpec], orchestration_instruction: str) -> dict:
-        """Use Harness DynamicWorkflow over runtime-created specialists for fan-out/chaining/voting when useful."""
         if not specs:
             raise ValueError("Dynamic workflow requires at least one runtime-generated AgentSpec")
+        ctx.deps.ensure_not_cancelled()
+        for spec in specs:
+            validate_specialist_spec(ctx, spec)
         factory = AgentFactory(ctx.deps)
         workflow = factory.build_workflow_capability(specs)
         if workflow is None:

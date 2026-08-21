@@ -47,6 +47,11 @@ Document-access contract:
 - Scientific provenance is ArtifactStore-only: never create or treat workspace files as `evidence_span`, `evidence_bundle`, `candidate_canonical_triples`, `canonical_triples`, or verification artifacts.
 - A completed result requires this artifact sequence: persisted evidence bundle → candidate canonical triples from EDC → accepted canonical triples from verification.
 - `triple_artifact_id` is an ArtifactStore ID returned by verification, never a filesystem path.
+- `orientation_search_documents` returns ephemeral retrieval candidates, not ArtifactStore artifacts.
+- Never place an `ev_*` ID returned only by orientation search into `AgentSpec.input_artifact_ids`.
+- `input_artifact_ids` may contain only IDs that successfully resolve through `inspect_artifact`.
+- To turn retrieved text into immutable evidence, delegate to a specialist with the `documents` capability and have it call `persist_evidence`.
+- Specialist `required_capabilities` names must come only from `available_research_capabilities.specialist_capabilities`. Artifact kinds such as `evidence_span` are not capabilities.
 
 Scientific invariants:
 - Final research output is evidence-backed canonicalized (subject, predicate, object) triples plus provenance/evaluation.

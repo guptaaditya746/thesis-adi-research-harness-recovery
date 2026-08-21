@@ -36,6 +36,19 @@ def register_research_tools(agent) -> None:
                 f"These IDs do not resolve: {missing}. IDs returned by orientation_search_documents "
                 "are retrieval candidates, not artifacts; delegate with the documents capability first."
             )
+        if "edc" in spec.required_capabilities:
+            evidence_inputs = []
+            for artifact_id in spec.input_artifact_ids:
+                try:
+                    if ctx.deps.artifacts.get_envelope(artifact_id).artifact_type == "evidence_bundle":
+                        evidence_inputs.append(artifact_id)
+                except KeyError:
+                    continue
+            if not evidence_inputs:
+                raise ValueError(
+                    "An EDC specialist requires an evidence_bundle artifact in input_artifact_ids. "
+                    "Select and persist evidence with a documents specialist before running EDC."
+                )
 
 
     @agent.tool
@@ -115,15 +128,22 @@ def register_research_tools(agent) -> None:
             key=lambda x: -(x.get("score") or 0.0),
         )[:30]
 
+        candidate_ref = ctx.deps.artifacts.put(
+            "retrieval_candidate_bundle",
+            {"query": query, "spans": candidates},
+            label=f"Orientation retrieval candidates: {query}",
+            creator_agent_id="research_director",
+        )
+
         return {
             "candidates": candidates,
             "provenance_status": "retrieval_candidates_only",
-            "artifact_ids": [],
+            "candidate_bundle_artifact_id": candidate_ref.id,
+            "artifact_ids": [candidate_ref.id],
             "instruction": (
-                "These EvidenceSpan IDs are retrieval candidate IDs, not ArtifactStore IDs. "
-                "Do not place them in AgentSpec.input_artifact_ids. "
-                "To persist evidence, create a specialist with required_capabilities=['documents']; "
-                "the specialist should search/read/expand as needed and call persist_evidence."
+                "These spans are retrieval candidates, not accepted evidence. Pass the candidate_bundle_artifact_id "
+                "in AgentSpec.input_artifact_ids to a documents specialist. The specialist should select, validate, "
+                "and persist source-grounded evidence with persist_evidence."
             ),
         }
 

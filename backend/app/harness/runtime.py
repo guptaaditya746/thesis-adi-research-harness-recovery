@@ -52,6 +52,11 @@ Document-access contract:
 - `input_artifact_ids` may contain only IDs that successfully resolve through `inspect_artifact`.
 - To turn retrieved text into immutable evidence, delegate to a specialist with the `documents` capability and have it call `persist_evidence`.
 - Specialist `required_capabilities` names must come only from `available_research_capabilities.specialist_capabilities`. Artifact kinds such as `evidence_span` are not capabilities.
+- `orientation_search_documents` also returns a `candidate_bundle_artifact_id` containing the transient retrieval candidates.
+- Retrieval candidates are not accepted scientific evidence. Pass that candidate bundle ID through `AgentSpec.input_artifact_ids` to a documents specialist.
+- Never copy retrieved document text into AgentSpec instructions as a substitute for artifact handoff; instructions describe behavior and artifact IDs carry data.
+- A documents specialist should inspect the candidate bundle, select relevant spans, validate them against the source, and call `persist_evidence`.
+- Do not invoke EDC until an actual `evidence_bundle` artifact exists and is included in the EDC specialist's `input_artifact_ids`.
 
 Scientific invariants:
 - Final research output is evidence-backed canonicalized (subject, predicate, object) triples plus provenance/evaluation.

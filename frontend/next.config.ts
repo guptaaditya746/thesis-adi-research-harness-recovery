@@ -6,7 +6,7 @@ const backend =
 
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ["141.54.132.137"],
+  allowedDevOrigins: ["localhost", "127.0.0.1", "141.54.132.236", "141.54.132.137"],
   async rewrites() {
     return [
       {

@@ -61,15 +61,50 @@ def register_research_tools(agent) -> None:
         return ref.model_dump(mode="json")
 
     @agent.tool
-    async def orientation_search_documents(ctx: RunContext[HarnessDeps], query: str, limit_per_document: int = 5) -> list[dict]:
-        """Cheap lexical orientation the Director may use before deciding whether to delegate."""
+    async def orientation_search_documents(
+        ctx: RunContext[HarnessDeps],
+        query: str,
+        limit_per_document: int = 5,
+    ) -> dict:
+        """
+        Cheap lexical orientation for the Director.
+
+        Returned evidence candidates are NOT ArtifactStore artifacts.
+        Their IDs must not be passed as input_artifact_ids.
+        Delegate to a specialist with the `documents` capability to
+        retrieve, validate, and persist evidence.
+        """
         ctx.deps.ensure_not_cancelled()
+
         rows = []
+
         for doc_id in ctx.deps.document_ids:
-            rows.extend(x.model_dump(mode="json") for x in ctx.deps.retrieval.search(
-                ctx.deps.pdf.load(doc_id), query, min(limit_per_document, 10), agent_id="research_director"
-            ))
-        return sorted(rows, key=lambda x: -(x.get("score") or 0.0))[:30]
+            rows.extend(
+                x.model_dump(mode="json")
+                for x in ctx.deps.retrieval.search(
+                    ctx.deps.pdf.load(doc_id),
+                    query,
+                    min(limit_per_document, 10),
+                    agent_id="research_director",
+                )
+            )
+
+        candidates = sorted(
+            rows,
+            key=lambda x: -(x.get("score") or 0.0),
+        )[:30]
+
+        return {
+            "candidates": candidates,
+            "provenance_status": "retrieval_candidates_only",
+            "artifact_ids": [],
+            "instruction": (
+                "These EvidenceSpan IDs are retrieval candidate IDs, not ArtifactStore IDs. "
+                "Do not place them in AgentSpec.input_artifact_ids. "
+                "To persist evidence, create a specialist with required_capabilities=['documents']; "
+                "the specialist should search/read/expand as needed and call persist_evidence."
+            ),
+        }
 
     @agent.tool
     async def orientation_search_ontology(ctx: RunContext[HarnessDeps], terms: list[str], limit: int = 20) -> list[dict]:

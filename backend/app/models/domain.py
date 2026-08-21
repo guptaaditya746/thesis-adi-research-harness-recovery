@@ -214,6 +214,15 @@ class EvidenceSpan(BaseModel):
         return value
 
 
+class RetrievalCandidateBundle(BaseModel):
+    """Immutable orientation results; candidates are not accepted evidence."""
+
+    query: str
+    spans: list[EvidenceSpan] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    retrieval_method: str = "sqlite_fts5_bm25"
+
+
 class EvidenceBundle(BaseModel):
     id: str = Field(default_factory=lambda: new_id("bundle"))
     spans: list[EvidenceSpan]

@@ -10,6 +10,7 @@ from pydantic_ai import Agent, UsageLimits
 
 from app.agents.model_factory import build_model, model_metadata
 from app.agents.toolsets import build_specialist_toolsets
+from app.harness.contracts import validate_specialist_spec
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import AgentSpec, ModelProfile, RecoveryAction, SpecialistResult
@@ -23,6 +24,7 @@ class AgentFactory:
 
     async def run(self, spec: AgentSpec) -> SpecialistResult:
         self.deps.ensure_not_cancelled()
+        validate_specialist_spec(self.deps, spec)
         if self.deps.registry.get(self.deps.run_id).state and self.deps.registry.get(self.deps.run_id).state.delegate_calls >= self.deps.settings.max_subagent_calls:
             raise RuntimeError("MAX_SUBAGENT_CALLS budget exhausted")
 
@@ -135,12 +137,16 @@ class AgentFactory:
         """Host-enforced dynamic fan-out over runtime-generated specialist specs."""
         if not specs:
             return []
+        for spec in specs:
+            validate_specialist_spec(self.deps, spec)
         remaining = self.deps.settings.max_subagent_calls - (self.deps.registry.get(self.deps.run_id).state.delegate_calls if self.deps.registry.get(self.deps.run_id).state else 0)
         specs = specs[:max(0, remaining)]
         return await asyncio.gather(*(self.run(s) for s in specs))
 
     def build_workflow_capability(self, specs: list[AgentSpec]):
         """Build Harness DynamicWorkflow from runtime-created specialists when scripted fan-out/chaining is useful."""
+        for spec in specs:
+            validate_specialist_spec(self.deps, spec)
         if not self.deps.settings.enable_dynamic_workflow:
             return None
         from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
@@ -181,20 +187,17 @@ class AgentFactory:
 
     def _task_prompt(self, spec: AgentSpec) -> str:
         artifacts = []
-        chars = 0
         for aid in spec.input_artifact_ids:
             try:
-                content = self.deps.artifacts.get(aid)
+                envelope = self.deps.artifacts.get_envelope(aid)
             except KeyError:
-                content = {"error": "artifact not found"}
-            text = str(content)
-            remain = max(0, spec.context_budget - chars)
-            if remain <= 0:
-                break
-            if len(text) > remain:
-                text = text[:remain] + f"… [artifact {aid} truncated in prompt; inspect it with artifact tool]"
-            artifacts.append(f"ARTIFACT {aid}:\n{text}")
-            chars += len(text)
+                artifacts.append(f"ARTIFACT {aid}: unavailable; use the typed artifact tool to inspect it")
+                continue
+            parents = ", ".join(envelope.parent_artifact_ids) or "none"
+            artifacts.append(
+                f"ARTIFACT {aid}: kind={envelope.artifact_type}; created_by={envelope.creator_agent_id}; "
+                f"parents={parents}. Scientific payload is not embedded here; inspect it with the granted typed tools."
+            )
         return (
             f"Specialist role: {spec.role}\nObjective: {spec.objective}\n\n"
             f"Generated task instructions:\n{spec.instructions}\n\n"

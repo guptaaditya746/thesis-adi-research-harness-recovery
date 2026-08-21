@@ -5,15 +5,19 @@ from typing import Any
 
 from pydantic_ai import FunctionToolset
 
+from app.harness.contracts import SUPPORTED_CAPABILITIES
 from app.harness.deps import HarnessDeps
 from app.models.domain import (
-    CanonicalTriple, EvidenceBundle, EvidenceSpan, OntologyProposal, OntologyProposalStatus, SPARQLArtifact,
-    SubOntologyArtifact, VerificationStatus,
+    CanonicalTriple,
+    EvidenceBundle,
+    EvidenceSpan,
+    OntologyProposal,
+    OntologyProposalStatus,
+    RetrievalCandidateBundle,
+    SPARQLArtifact,
+    SubOntologyArtifact,
+    VerificationStatus,
 )
-
-SUPPORTED_CAPABILITIES = {
-    "documents", "ontology", "sparql", "edc", "verification", "entity_normalization", "artifacts", "shell", "filesystem"
-}
 
 
 def build_specialist_toolsets(deps: HarnessDeps, capability_names: list[str], agent_id: str) -> list[FunctionToolset]:
@@ -23,6 +27,33 @@ def build_specialist_toolsets(deps: HarnessDeps, capability_names: list[str], ag
     return [builder(deps, agent_id) for name, builder in _BUILDERS.items() if name in capability_names]
 
 
+def read_retrieval_candidate_bundle(deps, artifact_id: str, offset: int = 0, limit: int = 8, preview_chars: int = 240) -> dict:
+    """Read bounded candidate metadata; full source text remains in document tools."""
+    envelope = deps.artifacts.get_envelope(artifact_id)
+    if envelope.artifact_type != "retrieval_candidate_bundle":
+        raise ValueError(f"Artifact {artifact_id} is {envelope.artifact_type}, not retrieval_candidate_bundle")
+    bundle = RetrievalCandidateBundle.model_validate(envelope.content)
+    start = max(0, offset)
+    stop = start + max(1, min(limit, 20))
+    chars = max(32, min(preview_chars, 500))
+    candidates = []
+    for span in bundle.spans[start:stop]:
+        item = span.model_dump(mode="json")
+        item["text"] = span.text if len(span.text) <= chars else span.text[:chars - 1] + "…"
+        candidates.append(item)
+    return {
+        "artifact_id": artifact_id,
+        "query": bundle.query,
+        "document_ids": bundle.document_ids,
+        "retrieval_method": bundle.retrieval_method,
+        "candidate_count": len(bundle.spans),
+        "offset": start,
+        "limit": stop - start,
+        "candidates": candidates,
+        "provenance_status": "retrieval_candidates_only",
+    }
+
+
 def _document_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
     ts = FunctionToolset(instructions="Use lexical/structural retrieval only. Do not request embeddings or entire PDFs unless a narrow read cannot answer the task.")
 
@@ -30,6 +61,10 @@ def _document_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
     def list_documents() -> list[dict]:
         deps.ensure_not_cancelled()
         return [deps.retrieval.inspect_metadata(deps.pdf.load(x)) for x in deps.document_ids]
+
+    @ts.tool_plain
+    def read_retrieval_candidates(artifact_id: str, offset: int = 0, limit: int = 8, preview_chars: int = 240) -> dict:
+        return read_retrieval_candidate_bundle(deps, artifact_id, offset, limit, preview_chars)
 
     @ts.tool_plain
     def search_documents(query: str, document_ids: list[str] | None = None, limit_per_document: int = 8) -> list[dict]:

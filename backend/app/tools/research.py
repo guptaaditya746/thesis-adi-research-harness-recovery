@@ -7,50 +7,36 @@ from pydantic_ai import Agent, RunContext, UsageLimits
 from app.agents.factory import AgentFactory
 from app.agents.model_factory import build_model
 from app.agents.toolsets import SUPPORTED_CAPABILITIES
+from app.harness.contracts import validate_specialist_spec
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import (
-    AgentSpec, DecisionRecord, ModelProfile, PartialResearchResult, SpecialistResult,
+    AgentSpec,
+    DecisionRecord,
+    EvidenceSpan,
+    ModelProfile,
+    PartialResearchResult,
+    RetrievalCandidateBundle,
+    SpecialistResult,
 )
+
+
+def persist_retrieval_candidate_bundle(deps: HarnessDeps, query: str, spans: list[EvidenceSpan]):
+    bundle = RetrievalCandidateBundle(
+        query=query,
+        spans=spans,
+        document_ids=sorted({span.document_id for span in spans}),
+        retrieval_method=spans[0].retrieval_method if spans else "sqlite_fts5_bm25",
+    )
+    return deps.artifacts.put(
+        "retrieval_candidate_bundle", bundle,
+        label=f"Orientation retrieval candidates: {query}",
+        creator_agent_id="research_director",
+    )
 
 
 def register_research_tools(agent) -> None:
     """Small meta-capability surface for the long-lived Research Director."""
-    def validate_specialist_spec(ctx: RunContext[HarnessDeps], spec: AgentSpec) -> None:
-        unknown = sorted(set(spec.required_capabilities) - set(SUPPORTED_CAPABILITIES))
-        if unknown:
-            raise ValueError(
-                "Unknown specialist capabilities: " + ", ".join(unknown)
-                + ". Valid capabilities are: " + ", ".join(sorted(SUPPORTED_CAPABILITIES))
-                + ". Artifact kinds such as evidence_span are not capabilities."
-            )
-        missing = []
-        for artifact_id in spec.input_artifact_ids:
-            try:
-                ctx.deps.artifacts.get(artifact_id)
-            except KeyError:
-                missing.append(artifact_id)
-        if missing:
-            raise ValueError(
-                "AgentSpec.input_artifact_ids must contain persisted ArtifactStore IDs. "
-                f"These IDs do not resolve: {missing}. IDs returned by orientation_search_documents "
-                "are retrieval candidates, not artifacts; delegate with the documents capability first."
-            )
-        if "edc" in spec.required_capabilities:
-            evidence_inputs = []
-            for artifact_id in spec.input_artifact_ids:
-                try:
-                    if ctx.deps.artifacts.get_envelope(artifact_id).artifact_type == "evidence_bundle":
-                        evidence_inputs.append(artifact_id)
-                except KeyError:
-                    continue
-            if not evidence_inputs:
-                raise ValueError(
-                    "An EDC specialist requires an evidence_bundle artifact in input_artifact_ids. "
-                    "Select and persist evidence with a documents specialist before running EDC."
-                )
-
-
     @agent.tool
     async def available_research_capabilities(ctx: RunContext[HarnessDeps]) -> dict:
         """Inspect specialist capabilities and execution constraints; this is not a workflow stage list."""
@@ -103,10 +89,10 @@ def register_research_tools(agent) -> None:
         """
         Cheap lexical orientation for the Director.
 
-        Returned evidence candidates are NOT ArtifactStore artifacts.
-        Their IDs must not be passed as input_artifact_ids.
-        Delegate to a specialist with the `documents` capability to
-        retrieve, validate, and persist evidence.
+        The returned candidate spans are not accepted evidence.
+        The complete retrieval result is stored in a retrieval_candidate_bundle artifact.
+        Delegate that artifact to a specialist with the `documents` capability for
+        selection, source validation, and evidence persistence.
         """
         ctx.deps.ensure_not_cancelled()
 
@@ -123,23 +109,24 @@ def register_research_tools(agent) -> None:
                 )
             )
 
-        candidates = sorted(
+        spans = sorted(
             rows,
             key=lambda x: -(x.get("score") or 0.0),
         )[:30]
-
-        candidate_ref = ctx.deps.artifacts.put(
-            "retrieval_candidate_bundle",
-            {"query": query, "spans": candidates},
-            label=f"Orientation retrieval candidates: {query}",
-            creator_agent_id="research_director",
-        )
+        span_models = [EvidenceSpan.model_validate(row) for row in spans]
+        candidate_ref = persist_retrieval_candidate_bundle(ctx.deps, query, span_models)
+        previews = []
+        for span in span_models:
+            preview = span.model_dump(mode="json")
+            preview["text"] = span.text if len(span.text) <= 240 else span.text[:239] + "…"
+            previews.append(preview)
 
         return {
-            "candidates": candidates,
+            "candidates": previews,
+            "candidate_count": len(span_models),
+            "document_ids": sorted({span.document_id for span in span_models}),
             "provenance_status": "retrieval_candidates_only",
             "candidate_bundle_artifact_id": candidate_ref.id,
-            "artifact_ids": [candidate_ref.id],
             "instruction": (
                 "These spans are retrieval candidates, not accepted evidence. Pass the candidate_bundle_artifact_id "
                 "in AgentSpec.input_artifact_ids to a documents specialist. The specialist should select, validate, "
@@ -155,7 +142,7 @@ def register_research_tools(agent) -> None:
     async def spawn_specialist(ctx: RunContext[HarnessDeps], spec: AgentSpec) -> dict:
         """Create one isolated ephemeral PydanticAI specialist from this runtime-generated AgentSpec."""
         ctx.deps.ensure_not_cancelled()
-        validate_specialist_spec(ctx, spec)
+        validate_specialist_spec(ctx.deps, spec)
         output = await AgentFactory(ctx.deps).run(spec)
         return output.model_dump(mode="json")
 
@@ -164,7 +151,7 @@ def register_research_tools(agent) -> None:
         """Dynamically fan out independent specialists; each receives isolated context/toolsets."""
         ctx.deps.ensure_not_cancelled()
         for spec in specs:
-            validate_specialist_spec(ctx, spec)
+            validate_specialist_spec(ctx.deps, spec)
         outputs = await AgentFactory(ctx.deps).run_fanout(specs)
         return [x.model_dump(mode="json") for x in outputs]
 
@@ -174,7 +161,7 @@ def register_research_tools(agent) -> None:
             raise ValueError("Dynamic workflow requires at least one runtime-generated AgentSpec")
         ctx.deps.ensure_not_cancelled()
         for spec in specs:
-            validate_specialist_spec(ctx, spec)
+            validate_specialist_spec(ctx.deps, spec)
         factory = AgentFactory(ctx.deps)
         workflow = factory.build_workflow_capability(specs)
         if workflow is None:

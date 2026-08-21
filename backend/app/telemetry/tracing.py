@@ -96,11 +96,15 @@ class Telemetry:
             from opentelemetry import trace
 
             if self.settings.enable_langtrace and self.settings.langtrace_api_key:
+                # Langtrace 3.8.x performs a blocking GitHub release check during
+                # init (up to a 20s network timeout). Version monitoring is not part
+                # of request serving; skip it so backend startup stays fast.
+                os.environ.setdefault("LANGTRACE_ERROR_REPORTING", "False")
                 from langtrace_python_sdk import langtrace
 
                 # The SDK defaults Sentry error reporting to an enabled network
                 # client. Keep telemetry startup bounded unless explicitly opted in.
-                os.environ.setdefault("LANGTRACE_ERROR_REPORTING", "False")
+                langtrace.check_if_sdk_is_outdated = lambda: None
                 kwargs: dict[str, Any] = {"api_key": self.settings.langtrace_api_key}
                 if self.settings.langtrace_api_host:
                     kwargs["api_host"] = self.settings.langtrace_api_host

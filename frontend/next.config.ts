@@ -1,12 +1,12 @@
 import type { NextConfig } from "next";
 const backend =
-  process.env.NEXT_PUBLIC_API_BASE ??
   process.env.BACKEND_INTERNAL_URL ??
+  process.env.NEXT_PUBLIC_API_BASE ??
   "http://127.0.0.1:8000";
 
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ["141.54.132.236"],
+  allowedDevOrigins: ["141.54.132.137"],
   async rewrites() {
     return [
       {

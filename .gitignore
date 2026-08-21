@@ -1,0 +1,43 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# runtime data
+backend/data/
+backend/**/artifacts/
+backend/**/harness_steps/
+backend/**/workspace/
+backend/**/*.sqlite3
+backend/**/*.db
+backend/**/*.pdf
+backend/**/page_*.txt
+
+# frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+**/.turbo/
+**/.cache/
+**/dist/
+**/build/
+
+# misc
+.DS_Store
+*.tsbuildinfo
+*.log
+*.pid
+.idea/
+.vscode/
+data/

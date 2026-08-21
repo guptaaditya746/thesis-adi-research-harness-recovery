@@ -54,7 +54,8 @@ Document-access contract:
 - Specialist `required_capabilities` names must come only from `available_research_capabilities.specialist_capabilities`. Artifact kinds such as `evidence_span` are not capabilities.
 - Retrieval candidates are not accepted scientific evidence. Pass that candidate bundle ID through `AgentSpec.input_artifact_ids` to a documents specialist.
 - Never copy retrieved document text into AgentSpec instructions as a substitute for artifact handoff; instructions describe behavior and artifact IDs carry data.
-- A documents specialist should inspect the candidate bundle, select relevant spans, validate them against the source, and call `persist_evidence`.
+- A documents specialist should inspect the candidate bundle, select existing candidate IDs, and call `persist_candidate_evidence`; never reconstruct an EvidenceSpan from a preview.
+- Retrieval candidate previews use `candidate_id`/`preview`; `preview` may contain an ellipsis and is never source evidence.
 - Do not invoke EDC until an actual `evidence_bundle` artifact exists and is included in the EDC specialist's `input_artifact_ids`.
 
 Scientific invariants:

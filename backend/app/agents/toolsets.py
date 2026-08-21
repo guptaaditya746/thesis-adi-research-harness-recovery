@@ -14,10 +14,60 @@ from app.models.domain import (
     OntologyProposal,
     OntologyProposalStatus,
     RetrievalCandidateBundle,
+    RetrievalCandidatePreview,
     SPARQLArtifact,
     SubOntologyArtifact,
     VerificationStatus,
 )
+
+
+class CorrectableToolInputError(ValueError):
+    """A tool-input/provenance mistake the model can correct by rereading state."""
+
+
+def persist_candidate_evidence_from_bundle(
+    deps, agent_id: str, bundle_artifact_id: str, candidate_ids: list[str], sufficiency_summary: str,
+) -> dict:
+    if not candidate_ids:
+        raise CorrectableToolInputError("Select at least one candidate_id from the retrieval candidate bundle.")
+    envelope = deps.artifacts.get_envelope(bundle_artifact_id)
+    if envelope.artifact_type != "retrieval_candidate_bundle":
+        raise CorrectableToolInputError(
+            f"Artifact {bundle_artifact_id} is {envelope.artifact_type}, not retrieval_candidate_bundle."
+        )
+    bundle = RetrievalCandidateBundle.model_validate(envelope.content)
+    by_id = {span.id: span for span in bundle.spans}
+    unknown = [candidate_id for candidate_id in candidate_ids if candidate_id not in by_id]
+    if unknown:
+        raise CorrectableToolInputError(
+            f"Unknown candidate_id(s): {unknown}. Reread the retrieval candidate bundle and select existing IDs."
+        )
+    spans = [by_id[candidate_id] for candidate_id in dict.fromkeys(candidate_ids)]
+    if len(spans) > deps.settings.max_evidence_spans:
+        raise CorrectableToolInputError(
+            f"At most {deps.settings.max_evidence_spans} evidence spans may be persisted per bundle."
+        )
+    stable: list[EvidenceSpan] = []
+    refs = []
+    for span in spans:
+        _check_doc(deps, span.document_id)
+        valid, reason = deps.retrieval.validate_span(deps.pdf.load(span.document_id), span)
+        if not valid:
+            raise CorrectableToolInputError(
+                f"Candidate {span.id} failed source-resolution validation: {reason}. "
+                "Reread the source and select a different candidate; do not reconstruct its text."
+            )
+        stable.append(span)
+        refs.append(deps.artifacts.put(
+            "evidence_span", span, label=f"Evidence {span.document_id} p.{span.page}",
+            artifact_id=span.id, creator_agent_id=agent_id,
+        ).model_dump(mode="json"))
+    evidence = EvidenceBundle(spans=stable, sufficiency_summary=sufficiency_summary)
+    ref = deps.artifacts.put(
+        "evidence_bundle", evidence, label="Selected immutable evidence", creator_agent_id=agent_id,
+        parent_artifact_ids=[bundle_artifact_id, *[x["id"] for x in refs]],
+    )
+    return {"artifact_ref": ref.model_dump(mode="json"), "evidence_refs": refs, "bundle": evidence.model_dump(mode="json")}
 
 
 def build_specialist_toolsets(deps: HarnessDeps, capability_names: list[str], agent_id: str) -> list[FunctionToolset]:
@@ -38,9 +88,17 @@ def read_retrieval_candidate_bundle(deps, artifact_id: str, offset: int = 0, lim
     chars = max(32, min(preview_chars, 500))
     candidates = []
     for span in bundle.spans[start:stop]:
-        item = span.model_dump(mode="json")
-        item["text"] = span.text if len(span.text) <= chars else span.text[:chars - 1] + "…"
-        candidates.append(item)
+        truncated = len(span.text) > chars
+        candidates.append(RetrievalCandidatePreview(
+            candidate_id=span.id,
+            preview=span.text if not truncated else span.text[:chars - 1] + "…",
+            preview_truncated=truncated,
+            document_id=span.document_id,
+            page=span.page,
+            section_id=span.section_id,
+            block_id=span.block_id,
+            score=span.score,
+        ).model_dump(mode="json"))
     return {
         "artifact_id": artifact_id,
         "query": bundle.query,
@@ -55,7 +113,11 @@ def read_retrieval_candidate_bundle(deps, artifact_id: str, offset: int = 0, lim
 
 
 def _document_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
-    ts = FunctionToolset(instructions="Use lexical/structural retrieval only. Do not request embeddings or entire PDFs unless a narrow read cannot answer the task.")
+    ts = FunctionToolset(instructions=(
+        "Use lexical/structural retrieval only. Retrieval candidate previews are not evidence and do not contain source payloads. "
+        "Read the candidate bundle, select candidates by candidate_id, then call persist_candidate_evidence. "
+        "Never construct or edit EvidenceSpan provenance fields, and never pass preview text to persist_evidence."
+    ))
 
     @ts.tool_plain
     def list_documents() -> list[dict]:
@@ -65,6 +127,11 @@ def _document_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
     @ts.tool_plain
     def read_retrieval_candidates(artifact_id: str, offset: int = 0, limit: int = 8, preview_chars: int = 240) -> dict:
         return read_retrieval_candidate_bundle(deps, artifact_id, offset, limit, preview_chars)
+
+    @ts.tool_plain
+    def persist_candidate_evidence(bundle_artifact_id: str, candidate_ids: list[str], sufficiency_summary: str) -> dict:
+        """Persist exact spans selected by ID; never accept model-reconstructed preview text."""
+        return persist_candidate_evidence_from_bundle(deps, agent_id, bundle_artifact_id, candidate_ids, sufficiency_summary)
 
     @ts.tool_plain
     def search_documents(query: str, document_ids: list[str] | None = None, limit_per_document: int = 8) -> list[dict]:
@@ -141,10 +208,10 @@ def _document_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
     def persist_evidence(spans: list[EvidenceSpan], sufficiency_summary: str) -> dict:
         deps.ensure_not_cancelled()
         if len(spans) > deps.settings.max_evidence_spans:
-            raise ValueError(f"At most {deps.settings.max_evidence_spans} evidence spans may be persisted per bundle")
+            raise CorrectableToolInputError(f"At most {deps.settings.max_evidence_spans} evidence spans may be persisted per bundle")
         chars = sum(len(x.text) for x in spans)
         if chars > deps.settings.max_evidence_chars:
-            raise ValueError(
+            raise CorrectableToolInputError(
                 f"Evidence bundle is {chars} chars; narrow it below MAX_EVIDENCE_CHARS={deps.settings.max_evidence_chars}. "
                 "Evidence text is never truncated because provenance must remain exact."
             )
@@ -158,7 +225,7 @@ def _document_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
             _check_doc(deps, span.document_id)
             valid, reason = deps.retrieval.validate_span(deps.pdf.load(span.document_id), span)
             if not valid:
-                raise ValueError(f"Evidence {span.id} failed source-resolution validation: {reason}")
+                raise CorrectableToolInputError(f"Evidence {span.id} failed source-resolution validation: {reason}")
             stable.append(span)
             refs.append(deps.artifacts.put(
                 "evidence_span", span, label=f"Evidence {span.document_id} p.{span.page}",

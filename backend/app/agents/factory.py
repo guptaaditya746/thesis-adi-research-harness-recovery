@@ -96,7 +96,11 @@ class AgentFactory:
                 return output
             except Exception as exc:
                 last_error = exc
-                await self._record_recovery(spec, profile, attempt, exc, profiles[attempt + 1] if attempt + 1 < len(profiles) else None)
+                correctable = self._is_correctable_tool_input_failure(exc)
+                next_profile = None if correctable else (profiles[attempt + 1] if attempt + 1 < len(profiles) else None)
+                await self._record_recovery(spec, profile, attempt, exc, next_profile, correctable=correctable)
+                if correctable:
+                    break
                 if attempt + 1 < len(profiles):
                     await asyncio.sleep(min(2 ** attempt, 4))
                     continue
@@ -214,11 +218,18 @@ class AgentFactory:
             f"Role-specific instructions: {spec.instructions}"
         )
 
-    async def _record_recovery(self, spec: AgentSpec, profile: ModelProfile, attempt: int, exc: Exception, next_profile: ModelProfile | None) -> None:
-        level = 8 if next_profile and next_profile != profile else 3
+    async def _record_recovery(
+        self, spec: AgentSpec, profile: ModelProfile, attempt: int, exc: Exception,
+        next_profile: ModelProfile | None, *, correctable: bool = False,
+    ) -> None:
+        level = 3
+        action_name = "correct_tool_input" if correctable else "bounded_retry"
+        if next_profile and next_profile != profile:
+            level = 8
+            action_name = "model_escalation"
         action = RecoveryAction(
             level=level,
-            action="model_escalation" if level == 8 else "bounded_retry",
+            action=action_name,
             trigger=f"{type(exc).__name__}: {exc}",
             agent_id=spec.id,
             from_profile=profile,
@@ -230,6 +241,19 @@ class AgentFactory:
         await self.emitter.emit(type="recovery", actor=spec.id, action=action.action, title="Recovery action",
                                 status="info", summary=action.trigger, artifact_id=ref.id,
                                 payload=action.model_dump(mode="json"))
+
+    @staticmethod
+    def _is_correctable_tool_input_failure(exc: Exception) -> bool:
+        """Keep source/input contract failures on the reread/correct path, not model escalation."""
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        markers = ("source-resolution", "source resolution", "candidate_id", "EvidenceSpan", "preview text", "input_artifact_ids")
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, ValueError) and any(marker.lower() in str(current).lower() for marker in markers):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     def _remove_active(self, agent_id: str) -> None:
         run = self.deps.registry.get(self.deps.run_id)

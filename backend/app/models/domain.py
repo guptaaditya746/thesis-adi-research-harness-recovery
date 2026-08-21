@@ -214,6 +214,19 @@ class EvidenceSpan(BaseModel):
         return value
 
 
+class RetrievalCandidatePreview(BaseModel):
+    """Bounded, non-provenance preview returned for candidate selection."""
+
+    candidate_id: str
+    preview: str
+    preview_truncated: bool = False
+    document_id: str
+    page: int
+    section_id: str | None = None
+    block_id: str | None = None
+    score: float | None = None
+
+
 class RetrievalCandidateBundle(BaseModel):
     """Immutable orientation results; candidates are not accepted evidence."""
 

@@ -1,9 +1,10 @@
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.agents.factory import AgentFactory
-from app.agents.toolsets import read_retrieval_candidate_bundle
+from app.agents.toolsets import persist_candidate_evidence_from_bundle, read_retrieval_candidate_bundle
 from app.harness.contracts import validate_specialist_spec
 from app.models.domain import AgentSpec, EvidenceBundle, EvidenceSpan, RetrievalCandidateBundle
 from app.storage.artifacts import ArtifactStore
@@ -57,8 +58,62 @@ def test_candidate_bundle_read_is_bounded_and_typed(settings):
 
     assert result["artifact_id"] == ref.id
     assert result["candidate_count"] == 1
-    assert len(result["candidates"][0]["text"]) <= 80
-    assert result["candidates"][0]["id"]
+    candidate = result["candidates"][0]
+    assert len(candidate["preview"]) <= 80
+    assert candidate["preview_truncated"] is True
+    assert candidate["candidate_id"]
+    assert "text" not in candidate
+    assert "source_text_sha256" not in candidate
+    assert "start_char" not in candidate
+    assert "end_char" not in candidate
+
+
+def test_truncated_preview_is_never_an_evidence_span(settings):
+    store = ArtifactStore(settings, "run_preview_contract")
+    deps = make_deps(settings, store)
+    ref = persist_retrieval_candidate_bundle(deps, "q", [make_span("verbatim source " * 100)])
+
+    preview = read_retrieval_candidate_bundle(deps, ref.id, preview_chars=40)["candidates"][0]
+
+    assert "…" in preview["preview"]
+    assert preview["preview_truncated"] is True
+    assert preview["candidate_id"]
+    with pytest.raises(ValidationError):
+        EvidenceSpan.model_validate(preview)
+
+
+def test_selecting_candidate_by_id_persists_exact_full_span(settings):
+    store = ArtifactStore(settings, "run_candidate_persist")
+    span = make_span("verbatim source " * 100)
+
+    class Retrieval:
+        def validate_span(self, _doc, candidate):
+            return candidate.text == span.text, "unexpected source mismatch"
+
+    class Deps:
+        def __init__(self):
+            self.document_ids = ["doc_1"]
+            self.artifacts = store
+            self.retrieval = Retrieval()
+            self.settings = settings
+
+        def ensure_not_cancelled(self):
+            return None
+
+        class Pdf:
+            @staticmethod
+            def load(_doc_id):
+                return object()
+        pdf = Pdf()
+    deps = Deps()
+
+    bundle_ref = persist_retrieval_candidate_bundle(deps, "q", [span])
+    result = persist_candidate_evidence_from_bundle(deps, "evidence_selector", bundle_ref.id, [span.id], "sufficient")
+    evidence = EvidenceBundle.model_validate(store.get(result["artifact_ref"]["id"]))
+
+    assert evidence.spans[0].id == span.id
+    assert evidence.spans[0].text == span.text
+    assert "…" not in evidence.spans[0].text
 
 
 def test_specialist_prompt_contains_reference_not_scientific_payload(settings):

@@ -17,6 +17,7 @@ from app.models.domain import (
     ModelProfile,
     PartialResearchResult,
     RetrievalCandidateBundle,
+    RetrievalCandidatePreview,
     SpecialistResult,
 )
 
@@ -117,9 +118,17 @@ def register_research_tools(agent) -> None:
         candidate_ref = persist_retrieval_candidate_bundle(ctx.deps, query, span_models)
         previews = []
         for span in span_models:
-            preview = span.model_dump(mode="json")
-            preview["text"] = span.text if len(span.text) <= 240 else span.text[:239] + "…"
-            previews.append(preview)
+            truncated = len(span.text) > 240
+            previews.append(RetrievalCandidatePreview(
+                candidate_id=span.id,
+                preview=span.text if not truncated else span.text[:239] + "…",
+                preview_truncated=truncated,
+                document_id=span.document_id,
+                page=span.page,
+                section_id=span.section_id,
+                block_id=span.block_id,
+                score=span.score,
+            ).model_dump(mode="json"))
 
         return {
             "candidates": previews,
@@ -128,9 +137,9 @@ def register_research_tools(agent) -> None:
             "provenance_status": "retrieval_candidates_only",
             "candidate_bundle_artifact_id": candidate_ref.id,
             "instruction": (
-                "These spans are retrieval candidates, not accepted evidence. Pass the candidate_bundle_artifact_id "
-                "in AgentSpec.input_artifact_ids to a documents specialist. The specialist should select, validate, "
-                "and persist source-grounded evidence with persist_evidence."
+                "These are bounded previews only, not accepted evidence. Pass the candidate_bundle_artifact_id "
+                "in AgentSpec.input_artifact_ids to a documents specialist. The specialist must select existing "
+                "candidate_ids and call persist_candidate_evidence; never copy preview text into EvidenceSpan fields."
             ),
         }
 

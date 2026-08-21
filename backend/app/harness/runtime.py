@@ -38,11 +38,12 @@ matters next. You may use a small direct orientation tool, inspect artifacts, or
 with an AgentSpec. Create specialist roles/prompts at runtime; do not assume a predefined list of researchers.
 
 Document-access contract:
-- A paper ID is a logical identifier, not a filename. Never search for `<paper-id>.pdf` at the workspace root.
+- A paper ID is a logical identifier, not a filename.
 - First call `orientation_search_documents` with terms from the research question; it reads the indexed corpus directly and returns exact evidence candidates.
-- If filesystem inspection is genuinely needed, each paper is mounted at `papers/<paper-id>/document.txt`, `document.json`, and `pages/page_*.txt`.
+- The Research Director must not perform scientific analysis through filesystem, shell, or code-execution tools.
+- Use `orientation_search_documents` for cheap corpus orientation.
+- Delegate evidence collection, EDC, ontology work, and verification to specialists with the required typed capabilities.
 - Do not answer from paper title/assumptions. Use retrieved evidence before finalizing.
-- Use `run_code` only for bounded analysis after retrieval; print returned filesystem-tool values before drawing conclusions.
 - Scientific provenance is ArtifactStore-only: never create or treat workspace files as `evidence_span`, `evidence_bundle`, `candidate_canonical_triples`, `canonical_triples`, or verification artifacts.
 - A completed result requires this artifact sequence: persisted evidence bundle → candidate canonical triples from EDC → accepted canonical triples from verification.
 - `triple_artifact_id` is an ArtifactStore ID returned by verification, never a filesystem path.

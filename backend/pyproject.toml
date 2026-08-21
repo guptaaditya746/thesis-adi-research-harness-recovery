@@ -28,6 +28,9 @@ dependencies = [
   "opentelemetry-sdk>=1.36,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.36,<2",
   "langtrace-python-sdk>=3.7,<4",
+  # Langtrace 3.8.x still imports pkg_resources during instrumentation.
+  # Setuptools 82 removed that compatibility module.
+  "setuptools>=75,<82",
   "importlib-metadata>=9.0.0",
 ]
 

@@ -20,7 +20,7 @@ class AgentFactory:
     """Constructs isolated ephemeral PydanticAI specialists from model-generated AgentSpecs."""
     def __init__(self, deps: HarnessDeps):
         self.deps = deps
-        self.emitter = TraceEmitter(deps.registry, deps.run_id)
+        self.emitter = TraceEmitter(deps.registry, deps.run_id, deps.telemetry)
 
     async def run(self, spec: AgentSpec) -> SpecialistResult:
         self.deps.ensure_not_cancelled()
@@ -71,7 +71,7 @@ class AgentFactory:
                 }) as span:
                     result = await agent.run(
                         prompt,
-                        event_stream_handler=make_pydantic_event_handler(self.deps.registry, self.deps.run_id, spec.id),
+                        event_stream_handler=make_pydantic_event_handler(self.deps.registry, self.deps.run_id, self.deps.telemetry, spec.id),
                         usage_limits=UsageLimits(
                             request_limit=max(2, spec.max_tool_calls + self.deps.settings.llm_output_retries + 2),
                             tool_calls_limit=max(1, spec.max_tool_calls),

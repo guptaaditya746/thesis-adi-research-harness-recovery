@@ -4,7 +4,7 @@ from typing import Any
 
 from app.models.domain import AgentTraceEvent
 from app.storage.registry import RunRegistry
-from app.telemetry.tracing import get_telemetry, redact
+from app.telemetry.tracing import Telemetry, redact
 
 
 class TraceEmitter:
@@ -13,9 +13,10 @@ class TraceEmitter:
     Hidden framework thinking is never passed to this class. Every payload is redacted
     before both SQLite/SSE persistence and telemetry export.
     """
-    def __init__(self, registry: RunRegistry, run_id: str):
+    def __init__(self, registry: RunRegistry, run_id: str, telemetry: Telemetry):
         self.registry = registry
         self.run_id = run_id
+        self.telemetry = telemetry
 
     async def emit(self, *, type: str, actor: str, action: str, title: str,
                    status: str = "info", summary: str = "", artifact_id: str | None = None,
@@ -27,8 +28,7 @@ class TraceEmitter:
             status=status, summary=safe_summary, artifact_id=artifact_id,
             parent_event_id=parent_event_id, payload=safe_payload,
         )
-        telemetry = get_telemetry()
-        with telemetry.span(f"research.event.{type}.{action}", {
+        with self.telemetry.span(f"research.event.{type}.{action}", {
             "research.run_id": self.run_id,
             "research.event_id": evt.id,
             "research.event_type": type,
@@ -65,10 +65,10 @@ def _model_event_payload(event: Any, name: str) -> dict[str, Any]:
     return details
 
 
-def make_pydantic_event_handler(registry: RunRegistry, run_id: str, actor_fallback: str = "agent",
-                                model_metadata: dict[str, Any] | None = None):
+def make_pydantic_event_handler(registry: RunRegistry, run_id: str, telemetry: Telemetry,
+                                actor_fallback: str = "agent", model_metadata: dict[str, Any] | None = None):
     """Expose model/tool/retry boundaries without exposing ThinkingPart/hidden chain-of-thought."""
-    emitter = TraceEmitter(registry, run_id)
+    emitter = TraceEmitter(registry, run_id, telemetry)
 
     async def handler(ctx, event_stream):
         actor = getattr(getattr(ctx, "agent", None), "name", None) or getattr(ctx, "agent_name", None) or actor_fallback

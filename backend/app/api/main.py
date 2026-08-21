@@ -18,10 +18,13 @@ from app.services.triple_map import TripleMapService
 from app.services.workspaces import WorkspaceService
 from app.storage.artifacts import ArtifactStore
 from app.storage.registry import RunRegistry
+from app.telemetry.tracing import Telemetry, register_application_telemetry
 
 settings = get_settings()
 registry = RunRegistry(settings)
-harness = ResearchHarness(settings, registry)
+telemetry = Telemetry(settings)
+register_application_telemetry(telemetry)
+harness = ResearchHarness(settings, registry, telemetry=telemetry)
 pdf = PDFService(settings)
 triple_map = TripleMapService()
 workspaces = WorkspaceService(settings)
@@ -44,7 +47,11 @@ async def lifespan(_: FastAPI):
     for run in registry.recoverable():
         if run.status == "running" and run.resumable:
             _schedule(run.id, resume=True)
-    yield
+    try:
+        yield
+    finally:
+        telemetry.force_flush()
+        telemetry.shutdown()
 
 
 app = FastAPI(title="Thesis ADI Research Harness", version="0.3.0", lifespan=lifespan)
@@ -184,7 +191,7 @@ async def cancel_run(run_id: str):
     except KeyError as exc:
         raise HTTPException(404, "Run not found") from exc
     registry.cancel(run_id)
-    await TraceEmitter(registry, run_id).emit(
+    await TraceEmitter(registry, run_id, telemetry).emit(
         type="system", actor="user", action="cancellation_requested", title="Cancellation requested",
         summary="The run will stop cooperatively at the next model/tool/delegation boundary.",
     )

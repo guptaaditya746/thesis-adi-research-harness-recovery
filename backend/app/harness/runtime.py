@@ -79,7 +79,7 @@ If reliable completion is impossible, use `persist_partial_result` and return st
 
 
 class ResearchHarness:
-    def __init__(self, settings: Settings, registry: RunRegistry):
+    def __init__(self, settings: Settings, registry: RunRegistry, telemetry: Telemetry | None = None):
         self.settings = settings
         self.registry = registry
         self.pdf = PDFService(settings)
@@ -91,7 +91,7 @@ class ResearchHarness:
         self.verification = TripleVerificationService(settings)
         self.validation = StructuralValidationService()
         self.evaluation = EvaluationService()
-        self.telemetry = Telemetry(settings)
+        self.telemetry = telemetry or Telemetry(settings)
 
     async def execute(self, run_id: str, *, resume: bool = False) -> None:
         run = self.registry.get(run_id)
@@ -103,7 +103,7 @@ class ResearchHarness:
         workspace.mkdir(parents=True, exist_ok=True)
         self._mount_documents(workspace, run.document_ids)
         artifacts = ArtifactStore(self.settings, run.id)
-        emitter = TraceEmitter(self.registry, run.id)
+        emitter = TraceEmitter(self.registry, run.id, self.telemetry)
         if run.state is None:
             run.state = ResearchState(
                 run_id=run.id, workspace_id=run.workspace_id, document_ids=run.document_ids, question=run.question,
@@ -171,7 +171,7 @@ class ResearchHarness:
             output.triple_artifact_id = final_meta["id"]
             return output
 
-        event_handler = make_pydantic_event_handler(self.registry, run.id, "research_director")
+        event_handler = make_pydantic_event_handler(self.registry, run.id, self.telemetry, "research_director")
         initial_prompt = self._initial_prompt(run, artifacts, resume)
         message_history = None
         if resume and step_store is not None:

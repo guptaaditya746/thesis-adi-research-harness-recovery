@@ -74,7 +74,7 @@ def register_research_tools(agent) -> None:
     @agent.tool
     async def record_decision(ctx: RunContext[HarnessDeps], decision: DecisionRecord) -> dict:
         ref = ctx.deps.artifacts.put("decision", decision, creator_agent_id="research_director", parent_artifact_ids=decision.artifact_ids)
-        await TraceEmitter(ctx.deps.registry, ctx.deps.run_id).emit(
+        await TraceEmitter(ctx.deps.registry, ctx.deps.run_id, ctx.deps.telemetry).emit(
             type="decision", actor="research_director", action=decision.action, title="Research decision",
             summary=decision.reason, artifact_id=ref.id, payload=decision.model_dump(mode="json"),
         )
@@ -183,7 +183,7 @@ def register_research_tools(agent) -> None:
             model_settings={"temperature": ctx.deps.settings.llm_temperature, "max_tokens": ctx.deps.settings.llm_max_tokens},
         )
         result = await workflow_agent.run(
-            prompt, event_stream_handler=make_pydantic_event_handler(ctx.deps.registry, ctx.deps.run_id, "dynamic_workflow"),
+            prompt, event_stream_handler=make_pydantic_event_handler(ctx.deps.registry, ctx.deps.run_id, ctx.deps.telemetry, "dynamic_workflow"),
             usage_limits=UsageLimits(request_limit=max(3, ctx.deps.settings.max_subagent_calls + 3)),
             conversation_id=f"{ctx.deps.run_id}:dynamic_workflow",
         )

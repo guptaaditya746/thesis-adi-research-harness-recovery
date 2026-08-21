@@ -85,6 +85,9 @@ class Settings(BaseSettings):
     enable_logfire: bool = False
     logfire_token: str | None = None
     enable_langtrace: bool = True
+    # Phase 1 exports application spans only. Phase 2 can opt into SDK vendor
+    # auto-instrumentation after duplicate-span behavior is evaluated.
+    enable_langtrace_auto_instrumentation: bool = False
     langtrace_api_key: str | None = None
     langtrace_api_host: str = "https://langtrace.ai/"
     otel_exporter_otlp_endpoint: str | None = None

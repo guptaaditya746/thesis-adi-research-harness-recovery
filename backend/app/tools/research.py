@@ -29,6 +29,11 @@ def persist_retrieval_candidate_bundle(deps: HarnessDeps, query: str, spans: lis
         document_ids=sorted({span.document_id for span in spans}),
         retrieval_method=spans[0].retrieval_method if spans else "sqlite_fts5_bm25",
     )
+    return deps.artifacts.put(
+        "retrieval_candidate_bundle", bundle,
+        label=f"Orientation retrieval candidates: {query}",
+        creator_agent_id="research_director",
+    )
 
 
 def scientific_state_snapshot(deps: HarnessDeps) -> dict:
@@ -45,11 +50,6 @@ def scientific_state_snapshot(deps: HarnessDeps) -> dict:
                               "latest_artifact_id": rows[-1]["id"] if rows else None}
     return {"run_id": deps.run_id, "target_document_id": deps.target_document_id,
             "document_ids": deps.document_ids, "artifacts": observations}
-    return deps.artifacts.put(
-        "retrieval_candidate_bundle", bundle,
-        label=f"Orientation retrieval candidates: {query}",
-        creator_agent_id="research_director",
-    )
 
 
 def register_research_tools(agent) -> None:

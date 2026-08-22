@@ -49,6 +49,17 @@ def test_retrieval_candidates_are_persisted_as_a_bundle_not_evidence(settings):
     assert store.list("evidence_span") == []
 
 
+def test_retrieval_candidate_bundle_persistence_returns_an_artifact_ref(settings):
+    store = ArtifactStore(settings, "run_candidate_ref")
+    deps = make_deps(settings, store)
+
+    ref = persist_retrieval_candidate_bundle(deps, "research question", [make_span()])
+
+    assert ref is not None
+    assert ref.id
+    assert ref.kind == "retrieval_candidate_bundle"
+
+
 def test_candidate_bundle_read_is_bounded_and_typed(settings):
     store = ArtifactStore(settings, "run_handoff_read")
     deps = make_deps(settings, store)

@@ -14,6 +14,7 @@ from app.models.domain import OntologyElement, OntologyProposal, OntologyProposa
 DBLP = "https://dblp.org/rdf/schema#"
 RUN_OVERLAY_BASE = "https://example.org/thesis/run/"
 SCHEMA_VERSION = "2024-06-14"
+SNAPSHOT_BUILDER_VERSION = "ontology-service-v2"
 
 
 class OntologyService:
@@ -116,6 +117,12 @@ class OntologyService:
             turtle_path=str(path), seed_schema_version=SCHEMA_VERSION, selected_elements=selected,
             dependency_uris=sorted(closure - set(selected_uris)), proposals=proposals,
             validation_warnings=warnings, content_sha256=digest,
+            seed_ontology_sha256=self.seed_sha256,
+            selected_dblp_uris=sorted(selected_uris),
+            accepted_proposal_artifact_ids=[],
+            snapshot_ttl_sha256=digest,
+            triple_count=len(graph),
+            snapshot_builder_version=SNAPSHOT_BUILDER_VERSION,
         )
 
     # Compatibility name for older callers.

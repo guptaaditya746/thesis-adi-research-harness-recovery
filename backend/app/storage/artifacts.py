@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.models.domain import ArtifactEnvelope, ArtifactRef, ModelCallMetadata, new_id, stable_hash
+from app.models.domain import ArtifactEnvelope, ArtifactMetadata, ArtifactRef, ModelCallMetadata, new_id, stable_hash
 
 
 class ArtifactStore:
@@ -84,6 +84,29 @@ class ArtifactStore:
         if not item:
             raise KeyError(artifact_id)
         return ArtifactEnvelope.model_validate_json(Path(item["path"]).read_text(encoding="utf-8"))
+
+    def get_metadata(self, artifact_id: str) -> ArtifactMetadata:
+        """Return payload-free metadata for contract checks."""
+        item = self._index().get(artifact_id)
+        if not item:
+            raise KeyError(artifact_id)
+        return ArtifactMetadata(
+            artifact_id=artifact_id,
+            artifact_type=item["kind"],
+            run_id=self.run_id,
+            creator_agent_id=item.get("creator_agent_id", "unknown"),
+            parent_artifact_ids=list(item.get("parent_artifact_ids", [])),
+            schema_version=item.get("schema_version", "1.0"),
+            content_sha256=item.get("content_sha256", ""),
+        )
+
+    def require_kind(self, artifact_id: str, expected_kind: str) -> ArtifactMetadata:
+        metadata = self.get_metadata(artifact_id)
+        if metadata.artifact_type != expected_kind:
+            raise ValueError(
+                f"Artifact {artifact_id} has kind {metadata.artifact_type}; expected {expected_kind}."
+            )
+        return metadata
 
     def list(self, kind: str | None = None) -> list[dict[str, Any]]:
         items = [{"id": aid, **meta} for aid, meta in self._index().items()]

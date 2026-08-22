@@ -144,9 +144,13 @@ async def create_run(request: StartRunRequest):
             pdf.load(did)
         except Exception as exc:
             raise HTTPException(404, f"Document {did}: {exc}") from exc
+    target_document_id = request.target_document_id or request.document_ids[0]
+    if target_document_id not in request.document_ids:
+        raise HTTPException(400, "target_document_id must be one of document_ids")
     run = ExperimentRun(
         workspace_id=workspaces.normalize(request.workspace_id),
         document_ids=request.document_ids,
+        target_document_id=target_document_id,
         question=request.question.strip(),
         gold=request.gold,
     )

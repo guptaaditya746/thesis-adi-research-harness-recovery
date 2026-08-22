@@ -19,7 +19,7 @@ export type CanonicalTriple = {
   canonicalization:string; confidence_optional?:number;
 };
 export type RunInfo = {
-  id:string; workspace_id:string; document_ids:string[]; question:string;
+  id:string; workspace_id:string; document_ids:string[]; target_document_id?:string; question:string;
   status:string; active_actor?:string; created_at:string; updated_at:string;
   events:TraceEvent[]; final_answer?:string; final_triples:CanonicalTriple[];
   rejected_triples:Array<{triple:CanonicalTriple;reason:string}>;

@@ -60,6 +60,7 @@ export function ResearchConsole() {
 
   const [docs, setDocs] = useState<DocumentInfo[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
+  const [targetDocumentId, setTargetDocumentId] = useState<string>();
   const [view, setView] = useState<View>('research');
 
   const [input, setInput] = useState('');
@@ -89,11 +90,12 @@ export function ResearchConsole() {
           body: {
             messages,
             documentIds: selected,
+            targetDocumentId: targetDocumentId ?? selected[0],
             workspaceId,
           },
         }),
       }),
-    [selected, workspaceId],
+    [selected, targetDocumentId, workspaceId],
   );
 
   const {
@@ -157,6 +159,7 @@ export function ResearchConsole() {
 
     setDocs((current) => [document, ...current]);
     setSelected((current) => [...current, document.id]);
+    setTargetDocumentId((current) => current ?? document.id);
   }
 
   async function remove(id: string) {
@@ -165,6 +168,7 @@ export function ResearchConsole() {
     setSelected((current) =>
       current.filter((value) => value !== id),
     );
+    setTargetDocumentId((current) => current === id ? undefined : current);
 
     setDocs((current) =>
       current.filter((document) => document.id !== id),
@@ -172,11 +176,11 @@ export function ResearchConsole() {
   }
 
   function toggle(id: string) {
-    setSelected((current) =>
-      current.includes(id)
-        ? current.filter((value) => value !== id)
-        : [...current, id],
-    );
+    setSelected((current) => {
+      const next = current.includes(id) ? current.filter((value) => value !== id) : [...current, id];
+      setTargetDocumentId((target) => next.includes(target ?? '') ? target : next[0]);
+      return next;
+    });
   }
 
   async function inspect(id: string) {
@@ -312,8 +316,18 @@ export function ResearchConsole() {
                 <span>
                   {selected.length} paper
                   {selected.length === 1 ? '' : 's'} selected
+                  {targetDocumentId ? ` · target ${targetDocumentId}` : ''}
                   {runId ? ` · run ${runId}` : ''}
                 </span>
+
+                {selected.length > 1 && (
+                  <label>
+                    target{' '}
+                    <select value={targetDocumentId ?? selected[0]} onChange={(event) => setTargetDocumentId(event.target.value)}>
+                      {selected.map((id) => <option key={id} value={id}>{docs.find((doc) => doc.id === id)?.filename ?? id}</option>)}
+                    </select>
+                  </label>
+                )}
 
                 <button onClick={() => setView('documents')}>
                   manage corpus

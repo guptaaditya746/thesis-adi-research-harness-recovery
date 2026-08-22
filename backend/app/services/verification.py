@@ -6,7 +6,7 @@ from pydantic_ai import Agent
 from app.agents.model_factory import build_model
 from app.config import Settings
 from app.models.domain import (
-    CanonicalTriple, EvidenceBundle, ModelProfile, TripleVerification, VerificationDimensions, VerificationStatus,
+    CanonicalTriple, EvidenceBundle, ModelProfile, SubOntologyArtifact, TripleVerification, VerificationDimensions, VerificationStatus,
 )
 
 
@@ -44,6 +44,7 @@ class TripleVerificationService:
         self,
         triples: list[CanonicalTriple],
         bundle: EvidenceBundle,
+        ontology: SubOntologyArtifact | None = None,
         *,
         verifier_agent_id: str = "independent_triple_verifier",
     ) -> list[TripleVerification]:
@@ -57,6 +58,7 @@ class TripleVerificationService:
                 eligible.append(triple)
         if not eligible:
             return prefailed
+        relation_by_uri = {x.uri: x for x in (ontology.selected_elements if ontology else [])}
         chunks = []
         for t in eligible:
             evidence = "\n\n".join(
@@ -65,7 +67,9 @@ class TripleVerificationService:
             )
             chunks.append(
                 f"TRIPLE_ID={t.id}\nTRIPLE=({t.subject}, {t.predicate}, {t.object})\n"
-                f"PREDICATE_URI={t.predicate_uri or 'OPEN_RELATION'}\nEVIDENCE:\n{evidence}"
+                f"PREDICATE_URI={t.predicate_uri or 'OPEN_RELATION'}\n"
+                f"ONTOLOGY_RELATION={relation_by_uri.get(t.predicate_uri).description if t.predicate_uri in relation_by_uri else 'unresolved'}\n"
+                f"EVIDENCE:\n{evidence}"
             )
         result = await self.agent.run("\n\n---\n\n".join(chunks))
         by_id = {x.triple_id: x for x in result.output.judgements}

@@ -116,6 +116,28 @@ def test_selecting_candidate_by_id_persists_exact_full_span(settings):
     assert "…" not in evidence.spans[0].text
 
 
+def test_candidate_evidence_identity_ignores_sufficiency_summary(settings):
+    store = ArtifactStore(settings, "run_candidate_idempotent")
+    span = make_span()
+
+    class Retrieval:
+        @staticmethod
+        def validate_span(_doc, candidate):
+            return candidate.text == span.text, "unexpected source mismatch"
+
+    deps = SimpleNamespace(
+        document_ids=["doc_1"], artifacts=store, retrieval=Retrieval(), settings=settings,
+        pdf=SimpleNamespace(load=lambda _doc_id: object()),
+    )
+    bundle_ref = persist_retrieval_candidate_bundle(deps, "q", [span])
+
+    first = persist_candidate_evidence_from_bundle(deps, "selector", bundle_ref.id, [span.id], "first wording")
+    second = persist_candidate_evidence_from_bundle(deps, "selector", bundle_ref.id, [span.id, span.id], "different wording")
+
+    assert first["artifact_ref"]["id"] == second["artifact_ref"]["id"]
+    assert EvidenceBundle.model_validate(store.get(first["artifact_ref"]["id"])).sufficiency_summary == ""
+
+
 def test_specialist_prompt_contains_reference_not_scientific_payload(settings):
     store = ArtifactStore(settings, "run_prompt")
     deps = make_deps(settings, store)
@@ -130,13 +152,27 @@ def test_specialist_prompt_contains_reference_not_scientific_payload(settings):
     assert "PRIVATE SOURCE PAYLOAD" not in prompt
 
 
-def test_edc_requires_evidence_bundle(settings):
+def test_edc_specialist_can_start_for_extract_without_ontology(settings):
     store = ArtifactStore(settings, "run_edc_guard")
     deps = make_deps(settings, store)
     candidate_ref = persist_retrieval_candidate_bundle(deps, "q", [make_span()])
 
-    with pytest.raises(ValueError, match="evidence_bundle"):
-        validate_specialist_spec(deps, make_spec(required_capabilities=["edc"], input_artifact_ids=[candidate_ref.id]))
+    validate_specialist_spec(deps, make_spec(required_capabilities=["edc"], input_artifact_ids=[candidate_ref.id]))
+
+
+def test_wrong_artifact_reference_error_is_bounded_and_payload_free(settings):
+    store = ArtifactStore(settings, "run_bounded_error")
+    deps = make_deps(settings, store)
+    candidate_ref = persist_retrieval_candidate_bundle(deps, "q", [make_span("secret source " * 5000)])
+
+    from app.harness.contracts import InvalidArtifactKind, require_kind
+
+    with pytest.raises(InvalidArtifactKind) as exc_info:
+        require_kind(deps, candidate_ref.id, "ontology_snapshot")
+    message = str(exc_info.value)
+    assert len(message) <= 512
+    assert "secret source" not in message
+    assert "expected ontology_snapshot, got retrieval_candidate_bundle" in message
 
 
 def test_verification_requires_candidate_triples_and_evidence(settings):
@@ -144,7 +180,9 @@ def test_verification_requires_candidate_triples_and_evidence(settings):
     deps = make_deps(settings, store)
     evidence_ref = store.put("evidence_bundle", EvidenceBundle(spans=[make_span()]))
 
-    with pytest.raises(ValueError, match="candidate_canonical_triples"):
+    from app.harness.contracts import ScientificStateBlocked
+
+    with pytest.raises(ScientificStateBlocked, match="candidate_canonical_triples"):
         validate_specialist_spec(deps, make_spec(required_capabilities=["verification"], input_artifact_ids=[evidence_ref.id]))
 
     candidate_ref = store.put("candidate_canonical_triples", [])
@@ -152,3 +190,20 @@ def test_verification_requires_candidate_triples_and_evidence(settings):
         deps,
         make_spec(required_capabilities=["verification"], input_artifact_ids=[evidence_ref.id, candidate_ref.id]),
     )
+
+
+def test_candidate_lineage_resolves_exact_scientific_inputs(settings):
+    store = ArtifactStore(settings, "run_lineage")
+    evidence_ref = store.put("evidence_bundle", EvidenceBundle(spans=[make_span()]))
+    ontology_ref = store.put("ontology_snapshot", {"selected_elements": []})
+    open_ref = store.put("edc_open_triples", {"edc_execution_id": "edc_test", "evidence_bundle_artifact_id": evidence_ref.id, "triples": []}, parent_artifact_ids=[evidence_ref.id])
+    defs_ref = store.put("edc_relation_definitions", {"edc_execution_id": "edc_test", "open_triples_artifact_id": open_ref.id, "definitions": []}, parent_artifact_ids=[open_ref.id])
+    candidate_ref = store.put("candidate_canonical_triples", [], parent_artifact_ids=[open_ref.id, defs_ref.id, evidence_ref.id, ontology_ref.id])
+
+    from app.harness.contracts import resolve_candidate_lineage
+
+    lineage = resolve_candidate_lineage(make_deps(settings, store), candidate_ref.id)
+    assert lineage.evidence_bundle_id == evidence_ref.id
+    assert lineage.ontology_snapshot_id == ontology_ref.id
+    assert lineage.open_triples_id == open_ref.id
+    assert lineage.relation_definitions_id == defs_ref.id

@@ -23,6 +23,7 @@ class HarnessDeps:
     run_id: str
     workspace_id: str
     document_ids: list[str]
+    target_document_id: str
     artifacts: ArtifactStore
     registry: RunRegistry
     pdf: PDFService

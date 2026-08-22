@@ -9,10 +9,11 @@ export async function POST(req: Request) {
   const last = messages[messages.length - 1];
   const text = (last?.parts ?? []).filter((p:any)=>p.type==='text').map((p:any)=>p.text).join('\n').trim();
   const documentIds: string[] = body.documentIds ?? [];
+  const targetDocumentId: string | undefined = body.targetDocumentId;
   const workspaceId = body.workspaceId ?? 'default';
   if (!text || !documentIds.length) return new Response('Question and at least one document are required', { status: 400 });
 
-  const start = await fetch(`${backend}/api/runs`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({workspace_id:workspaceId,document_ids:documentIds,question:text}) });
+  const start = await fetch(`${backend}/api/runs`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({workspace_id:workspaceId,document_ids:documentIds,target_document_id:targetDocumentId,question:text}) });
   if (!start.ok) return new Response(await start.text(), { status:start.status });
   const run = await start.json();
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from uuid import uuid4
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
@@ -38,11 +39,15 @@ class CanonicalizationChoice(BaseModel):
 
 @dataclass
 class EDCResult:
+    edc_execution_id: str
+    evidence_bundle_artifact_id: str | None
+    ontology_snapshot_artifact_id: str | None
     open_triples: list[CandidateTriple]
     definitions: list[RelationDefinition]
     canonicalization_decisions: list[CanonicalizationDecision]
     canonical_triples: list[CanonicalTriple]
     ontology_proposals: list[OntologyProposal]
+    unresolved_open_triple_ids: list[str]
 
 
 class EDCService:
@@ -89,6 +94,90 @@ class EDCService:
             ),
         )
 
+    async def extract(
+        self,
+        bundle: EvidenceBundle,
+        *,
+        question: str,
+        schema_hints: list[OntologyElement] | None = None,
+    ) -> list[CandidateTriple]:
+        if not bundle.spans:
+            return []
+        hints = "\n".join(
+            f"- {r.label}: {r.description or ''} (domain={r.domain or '?'}, range={r.range or '?'})"
+            for r in (schema_hints or [])[:20]
+        ) or "(No schema hints supplied; keep predicates open.)"
+        extraction = await self.extract_agent.run(
+            f"Research question (scope only): {question}\n\n"
+            "Optional DBLP schema hints (orientation only; do not force these predicates):\n"
+            f"{hints}\n\nEvidence:\n{self._evidence_prompt(bundle)}"
+        )
+        allowed_evidence_ids = {s.id for s in bundle.spans}
+        out: list[CandidateTriple] = []
+        for triple in extraction.output.triples:
+            valid_ids = [eid for eid in triple.evidence_ids if eid in allowed_evidence_ids]
+            if valid_ids:
+                out.append(triple.model_copy(update={"evidence_ids": valid_ids}))
+        return out
+
+    async def define(self, open_triples: list[CandidateTriple]) -> list[RelationDefinition]:
+        distinct = sorted({t.predicate for t in open_triples})
+        if not distinct:
+            return []
+        defined = await self.define_agent.run(
+            "Open predicates:\n" + "\n".join(f"- {x}" for x in distinct)
+        )
+        by_rel = {self._norm(x.relation): x for x in defined.output.definitions}
+        return [
+            (by_rel.get(
+                self._norm(rel),
+                RelationDefinition(relation=rel, definition=f"Relation expressed by '{rel}' between subject and object."),
+            )).model_copy(update={
+                "open_triple_ids": [t.id for t in open_triples if self._norm(t.predicate) == self._norm(rel)]
+            })
+            for rel in distinct
+        ]
+
+    async def canonicalize(
+        self,
+        open_triples: list[CandidateTriple],
+        definitions: list[RelationDefinition],
+        relations: list[OntologyElement],
+        *,
+        run_id: str,
+        question: str,
+        producing_agent_id: str = "edc",
+        ontology_snapshot_id: str,
+    ) -> tuple[list[CanonicalizationDecision], list[CanonicalTriple], list[OntologyProposal], list[str]]:
+        def_map = {self._norm(x.relation): x.definition for x in definitions}
+        decisions: list[CanonicalizationDecision] = []
+        canonical: list[CanonicalTriple] = []
+        proposals: list[OntologyProposal] = []
+        unresolved: list[str] = []
+        for triple in open_triples:
+            definition = def_map.get(self._norm(triple.predicate), triple.predicate)
+            definition_id = next((x.id for x in definitions if self._norm(x.relation) == self._norm(triple.predicate)), None)
+            ranked = self.rank_candidates(triple, definition, relations, top_k=5)
+            decision, proposal = await self._decide(triple, definition, ranked, relations, run_id, question, producing_agent_id)
+            decisions.append(decision)
+            if proposal:
+                proposals.append(proposal)
+            selected = next((r for r in relations if r.uri == decision.selected_uri), None) if decision.selected_uri else None
+            if not selected:
+                unresolved.append(triple.id)
+                continue
+            canonical.append(CanonicalTriple(
+                subject=triple.subject, predicate=selected.label, object=triple.object,
+                predicate_uri=selected.uri, subject_type=triple.subject_type, object_type=triple.object_type,
+                original_open_triple=triple, canonicalization_decision_id=decision.id,
+                relation_definition_id=definition_id,
+                evidence_ids=triple.evidence_ids, producing_agent_id=producing_agent_id, run_id=run_id,
+                ontology_snapshot_id=ontology_snapshot_id,
+                canonicalization=("exact" if self._norm(selected.label) == self._norm(triple.predicate) else "llm_verified"),
+                confidence_optional=ranked[0].score if ranked else None,
+            ))
+        return decisions, canonical, proposals, unresolved
+
     async def run(
         self,
         bundle: EvidenceBundle,
@@ -98,67 +187,14 @@ class EDCService:
         question: str,
         producing_agent_id: str = "edc",
     ) -> EDCResult:
-        if not bundle.spans:
-            return EDCResult([], [], [], [], [])
-        evidence_text = self._evidence_prompt(bundle)
-        relation_hints = "\n".join(
-            f"- {r.label}: {r.description or ''} (domain={r.domain or '?'}, range={r.range or '?'})" for r in relations[:80]
+        execution_id = f"edc_{uuid4().hex[:16]}"
+        open_triples = await self.extract(bundle, question=question, schema_hints=relations)
+        definitions = await self.define(open_triples)
+        decisions, canonical, proposals, unresolved = await self.canonicalize(
+            open_triples, definitions, relations, run_id=run_id, question=question,
+            producing_agent_id=producing_agent_id, ontology_snapshot_id="",
         )
-        extraction = await self.extract_agent.run(
-            f"Research question (scope only): {question}\n\nActive ontology relation hints (not evidence):\n{relation_hints}\n\nEvidence:\n{evidence_text}"
-        )
-        allowed_evidence_ids = {s.id for s in bundle.spans}
-        open_triples: list[CandidateTriple] = []
-        for triple in extraction.output.triples:
-            valid_ids = [eid for eid in triple.evidence_ids if eid in allowed_evidence_ids]
-            if not valid_ids:
-                # Provenance is mandatory. Do not silently accept an extracted claim without exact evidence IDs.
-                continue
-            open_triples.append(triple.model_copy(update={"evidence_ids": valid_ids}))
-
-        distinct = sorted({t.predicate for t in open_triples})
-        definitions: list[RelationDefinition] = []
-        if distinct:
-            defined = await self.define_agent.run(
-                "Open predicates:\n" + "\n".join(f"- {x}" for x in distinct) + "\n\nEvidence:\n" + evidence_text
-            )
-            by_rel = {self._norm(x.relation): x for x in defined.output.definitions}
-            definitions = [
-                by_rel.get(self._norm(rel), RelationDefinition(relation=rel, definition=f"Relation expressed by '{rel}' between subject and object."))
-                for rel in distinct
-            ]
-
-        def_map = {self._norm(x.relation): x.definition for x in definitions}
-        decisions: list[CanonicalizationDecision] = []
-        canonical: list[CanonicalTriple] = []
-        proposals: list[OntologyProposal] = []
-        for triple in open_triples:
-            definition = def_map.get(self._norm(triple.predicate), triple.predicate)
-            ranked = self.rank_candidates(triple, definition, relations, top_k=5)
-            decision, proposal = await self._decide(triple, definition, ranked, relations, run_id, question, producing_agent_id)
-            decisions.append(decision)
-            if proposal:
-                proposals.append(proposal)
-            selected = next((r for r in relations if r.uri == decision.selected_uri), None) if decision.selected_uri else None
-            canonical.append(CanonicalTriple(
-                subject=triple.subject,
-                predicate=selected.label if selected else triple.predicate,
-                object=triple.object,
-                predicate_uri=selected.uri if selected else None,
-                subject_type=triple.subject_type,
-                object_type=triple.object_type,
-                original_open_triple=triple,
-                canonicalization_decision_id=decision.id,
-                evidence_ids=triple.evidence_ids,
-                producing_agent_id=producing_agent_id,
-                run_id=run_id,
-                canonicalization=(
-                    "exact" if selected and self._norm(selected.label) == self._norm(triple.predicate)
-                    else "llm_verified" if selected else "open_relation"
-                ),
-                confidence_optional=ranked[0].score if selected and ranked else None,
-            ))
-        return EDCResult(open_triples, definitions, decisions, canonical, proposals)
+        return EDCResult(execution_id, None, None, open_triples, definitions, decisions, canonical, proposals, unresolved)
 
     def rank_candidates(
         self,

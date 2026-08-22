@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
+import inspect
+import platform
 import shutil
 from pathlib import Path
 from typing import Any
 
 from pydantic_ai import Agent, ModelRetry, UsageLimits
+from pydantic import TypeAdapter
 
 from app.agents.model_factory import build_model
 from app.config import Settings
@@ -13,8 +17,10 @@ from app.harness.capabilities import build_director_capabilities
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import (
-    CanonicalTriple, ExperimentRun, PartialResearchResult, RejectedTriple, ResearchConclusion, ResearchState,
+    CanonicalTriple, ExperimentRun, PartialResearchConclusion, RejectedTriple, ResearchConclusion, ResearchState,
+    RunRuntimeIdentity, stable_hash,
 )
+from app.harness.contracts import resolve_candidate_lineage, ScientificStateBlocked
 from app.services.edc import EDCService
 from app.services.entities import EntityNormalizationService
 from app.services.evaluation import EvaluationService
@@ -45,7 +51,7 @@ Document-access contract:
 - Delegate evidence collection, EDC, ontology work, and verification to specialists with the required typed capabilities.
 - Do not answer from paper title/assumptions. Use retrieved evidence before finalizing.
 - Scientific provenance is ArtifactStore-only: never create or treat workspace files as `evidence_span`, `evidence_bundle`, `candidate_canonical_triples`, `canonical_triples`, or verification artifacts.
-- A completed result requires this artifact sequence: persisted evidence bundle → candidate canonical triples from EDC → accepted canonical triples from verification.
+- A completed result requires this exact artifact sequence: evidence_bundle → edc_open_triples → edc_relation_definitions + ontology_snapshot → candidate_canonical_triples → independent verification → canonical_triples.
 - `triple_artifact_id` is an ArtifactStore ID returned by verification, never a filesystem path.
 - `orientation_search_documents` returns bounded previews plus a persisted `candidate_bundle_artifact_id`; the candidates are not accepted evidence.
 - Never place an `ev_*` ID returned only by orientation search into `AgentSpec.input_artifact_ids`.
@@ -56,7 +62,9 @@ Document-access contract:
 - Never copy retrieved document text into AgentSpec instructions as a substitute for artifact handoff; instructions describe behavior and artifact IDs carry data.
 - A documents specialist should inspect the candidate bundle, select existing candidate IDs, and call `persist_candidate_evidence`; never reconstruct an EvidenceSpan from a preview.
 - Retrieval candidate previews use `candidate_id`/`preview`; `preview` may contain an ellipsis and is never source evidence.
-- Do not invoke EDC until an actual `evidence_bundle` artifact exists and is included in the EDC specialist's `input_artifact_ids`.
+- EDC Extract requires an evidence_bundle. EDC Define requires edc_open_triples. EDC Canonicalize requires the matching open triples, relation definitions, and a run-specific ontology_snapshot.
+- Use EDC relation definitions as the primary query for DBLP relation retrieval before Canonicalize. Prefer a justified run-local ontology proposal to an inappropriate DBLP predicate.
+- A blocked specialist is expected when scientific state is missing; continue from its persisted artifacts rather than retrying or escalating the model.
 
 Scientific invariants:
 - Final research output is evidence-backed canonicalized (subject, predicate, object) triples plus provenance/evaluation.
@@ -115,8 +123,11 @@ class ResearchHarness:
             run.state.status = "running"
         self.registry.persist(run)
 
+        target_document_id = run.target_document_id or run.document_ids[0]
+        run.target_document_id = target_document_id
         deps = HarnessDeps(
             settings=self.settings, run_id=run.id, workspace_id=run.workspace_id, document_ids=run.document_ids,
+            target_document_id=target_document_id,
             artifacts=artifacts, registry=self.registry, pdf=self.pdf, retrieval=self.retrieval,
             ontology=self.ontology, sparql=self.sparql, edc=self.edc, entities=self.entities,
             verification=self.verification, validation=self.validation, evaluation=self.evaluation, telemetry=self.telemetry,
@@ -132,24 +143,41 @@ class ResearchHarness:
         register_research_tools(director)
         register_configured_extensions(director, self.settings)
 
+        initial_prompt = self._initial_prompt(run, artifacts, resume)
+        identity_ref = self._persist_runtime_identity(run, artifacts, initial_prompt)
+        run.runtime_identity_artifact_ids.append(identity_ref.id)
+        self.registry.persist(run)
+
         @director.output_validator
         async def completion_gate(ctx, output: ResearchConclusion) -> ResearchConclusion:
+            if isinstance(output, PartialResearchConclusion):
+                try:
+                    partial_meta = ctx.deps.artifacts.get_metadata(output.partial_result_artifact_id)
+                except KeyError as exc:
+                    raise ModelRetry("Partial output requires a persisted partial_result artifact ID.") from exc
+                if partial_meta.artifact_type != "partial_result":
+                    raise ModelRetry("partial_result_artifact_id must reference a partial_result artifact.")
+                return output
             final_meta = ctx.deps.artifacts.find_latest("canonical_triples")
             if not final_meta:
                 raise ModelRetry(
                     "Terminal output is not auditable yet. Persist accepted canonical triples with verification, or call "
                     "persist_partial_result to create an explicit empty/partial final triple artifact."
                 )
-            if output.status == "completed":
-                evidence_bundle = ctx.deps.artifacts.find_latest("evidence_bundle")
-                candidate_triples = ctx.deps.artifacts.find_latest("candidate_canonical_triples")
-                if not evidence_bundle or not candidate_triples:
-                    raise ModelRetry("A completed result requires persisted evidence_bundle and candidate_canonical_triples artifacts. Delegate to a specialist with documents, ontology, edc, and verification capabilities.")
-                if candidate_triples["id"] not in final_meta.get("parent_artifact_ids", []):
-                    raise ModelRetry("Final canonical_triples must be created by verification from candidate_canonical_triples, not by a filesystem write.")
-                if evidence_bundle["id"] not in candidate_triples.get("parent_artifact_ids", []):
-                    raise ModelRetry("Candidate canonical triples must descend from a persisted evidence_bundle.")
-            triples = [CanonicalTriple.model_validate(x) for x in ctx.deps.artifacts.get(final_meta["id"])]
+            candidate_id = next((x for x in final_meta.get("parent_artifact_ids", []) if ctx.deps.artifacts.get_metadata(x).artifact_type == "candidate_canonical_triples"), None)
+            if not candidate_id:
+                raise ModelRetry("Final canonical_triples must be created by verification from candidate_canonical_triples.")
+            try:
+                lineage = resolve_candidate_lineage(ctx.deps, candidate_id)
+            except ScientificStateBlocked as exc:
+                raise ModelRetry(str(exc)) from exc
+            parents = set(final_meta.get("parent_artifact_ids", []))
+            if not {lineage.evidence_bundle_id, lineage.ontology_snapshot_id}.issubset(parents):
+                raise ModelRetry("Final canonical_triples must retain the exact evidence_bundle and ontology_snapshot lineage.")
+            try:
+                triples = [CanonicalTriple.model_validate(x) for x in ctx.deps.artifacts.get(final_meta["id"])]
+            except Exception as exc:
+                raise ModelRetry("The persisted canonical_triples artifact violates its stored schema.") from exc
             for triple in triples:
                 if not triple.evidence_ids:
                     raise ModelRetry(f"Triple {triple.id} has no evidence IDs and cannot be accepted.")
@@ -167,13 +195,20 @@ class ResearchHarness:
                     ok, reason = ctx.deps.retrieval.validate_span(ctx.deps.pdf.load(span.document_id), span)
                     if not ok:
                         raise ModelRetry(f"Evidence integrity failed for {evidence_id}: {reason}")
-            if output.triple_artifact_id and output.triple_artifact_id != final_meta["id"]:
+            rendered = self._render_answer(triples)
+            answer_ref = ctx.deps.artifacts.put(
+                "research_answer", {"answer": rendered, "triple_artifact_id": final_meta["id"]},
+                creator_agent_id="research_harness", parent_artifact_ids=[final_meta["id"]],
+                artifact_id=f"answer_{final_meta['id']}",
+            )
+            output.answer = rendered
+            output.answer_summary = f"{len(triples)} accepted canonical triples grounded in the verified research artifact."
+            output.answer_artifact_id = answer_ref.id
+            if output.triple_artifact_id != final_meta["id"]:
                 raise ModelRetry(f"Use the final canonical_triples artifact id {final_meta['id']} in triple_artifact_id.")
-            output.triple_artifact_id = final_meta["id"]
             return output
 
         event_handler = make_pydantic_event_handler(self.registry, run.id, self.telemetry, "research_director")
-        initial_prompt = self._initial_prompt(run, artifacts, resume)
         message_history = None
         if resume and step_store is not None:
             message_history = await self._resume_history(step_store, run.id)
@@ -262,6 +297,14 @@ class ResearchHarness:
         self._evaluate(run, artifacts)
         self.registry.persist(run)
 
+    @staticmethod
+    def _render_answer(triples: list[CanonicalTriple]) -> str:
+        if not triples:
+            return "No independently verified canonical triples were accepted."
+        lines = ["Verified findings:"]
+        lines.extend(f"- {t.subject} — {t.predicate} — {t.object}" for t in triples)
+        return "\n".join(lines)
+
     def _finalize_existing_partial(self, run_id: str, artifacts: ArtifactStore, reason: str) -> None:
         run = self.registry.get(run_id)
         final_meta = artifacts.find_latest("canonical_triples")
@@ -342,6 +385,49 @@ class ResearchHarness:
                     except OSError:
                         shutil.copy2(p, link)
 
+    def _persist_runtime_identity(self, run: ExperimentRun, artifacts: ArtifactStore, initial_prompt: str):
+        def version(name: str) -> str | None:
+            try:
+                return importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                return None
+
+        declared = {
+            "runtime_id": self.settings.llm_runtime_id,
+            "runtime_revision": self.settings.llm_runtime_revision,
+            "context_window": self.settings.llm_context_window,
+            "chat_template": self.settings.llm_chat_template,
+            "reasoning_mode": self.settings.llm_reasoning_mode,
+            "reasoning_parser": self.settings.llm_reasoning_parser,
+            "tool_call_parser": self.settings.llm_tool_call_parser,
+            "runtime_backend": self.settings.llm_runtime_backend,
+            "quantization": self.settings.llm_runtime_quantization,
+            "dtype": self.settings.llm_runtime_dtype,
+            "tensor_parallel_size": self.settings.llm_runtime_tensor_parallel_size,
+        }
+        observed = {
+            "python": platform.python_version(),
+            "pydantic_ai": version("pydantic-ai"),
+            "pydantic_ai_harness": version("pydantic-ai-harness"),
+            "litellm": version("litellm"),
+            "model_by_profile": {profile: self.settings.model_for_profile(profile) for profile in ("fast", "balanced", "reasoning", "critic", "extractor")},
+            "temperature": self.settings.llm_temperature,
+            "max_tokens": self.settings.llm_max_tokens,
+        }
+        identity = RunRuntimeIdentity(
+            run_id=run.id,
+            observed={key: value for key, value in observed.items() if value is not None},
+            operator_declared={key: value for key, value in declared.items() if value is not None},
+            prompt_sha256=stable_hash({"director_instructions": DIRECTOR_INSTRUCTIONS, "initial_prompt": initial_prompt}),
+            tool_schema_sha256=stable_hash({
+                "register_research_tools": inspect.getsource(register_research_tools),
+                "output_type": "ResearchConclusion",
+            }),
+            output_schema_sha256=stable_hash(TypeAdapter(ResearchConclusion).json_schema()),
+            document_sha256={doc_id: self.pdf.load(doc_id).sha256 for doc_id in run.document_ids},
+        )
+        return artifacts.put("run_runtime_identity", identity, label="Observed runtime identity", creator_agent_id="research_harness")
+
     def _initial_prompt(self, run: ExperimentRun, artifacts: ArtifactStore, resume: bool) -> str:
         docs = [self.pdf.load(i) for i in run.document_ids]
         inventory = "\n".join(
@@ -350,8 +436,10 @@ class ResearchHarness:
         )
         prior = artifacts.list()
         prior_text = "\n".join(f"- {x['id']} [{x['kind']}] {x.get('label') or ''}" for x in prior[-30:]) or "(none)"
+        target = self.pdf.load(run.target_document_id or run.document_ids[0])
         return (
-            f"Research question:\n{run.question}\n\nAvailable papers:\n{inventory}\n\n"
+            f"Research question:\n{run.question}\n\nTarget paper:\n- {target.id}: {target.metadata.title or target.filename}\n\n"
+            f"Selected papers (you may explicitly broaden retrieval beyond the target):\n{inventory}\n\n"
             f"Existing run artifacts {'(resume)' if resume else ''}:\n{prior_text}\n\n"
             "Inspect the research state and choose the next useful action dynamically. Generate narrowly scoped AgentSpecs when "
             "specialization, independence, critique, or decomposition would improve reliability."

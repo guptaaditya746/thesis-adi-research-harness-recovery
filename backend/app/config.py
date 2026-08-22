@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 4096
     llm_output_retries: int = 3
 
+    # Optional, non-secret operator declarations for experiment reproducibility.
+    llm_runtime_id: str | None = None
+    llm_runtime_revision: str | None = None
+    llm_context_window: int | None = None
+    llm_chat_template: str | None = None
+    llm_reasoning_mode: str | None = None
+    llm_reasoning_parser: str | None = None
+    llm_tool_call_parser: str | None = None
+    llm_runtime_backend: str = "vllm"
+    llm_runtime_quantization: str | None = None
+    llm_runtime_dtype: str | None = None
+    llm_runtime_tensor_parallel_size: int | None = None
+
     # Agentic harness budgets
     max_agent_steps: int = 28
     max_subagent_calls: int = 18

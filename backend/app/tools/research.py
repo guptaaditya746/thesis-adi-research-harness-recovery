@@ -29,6 +29,22 @@ def persist_retrieval_candidate_bundle(deps: HarnessDeps, query: str, spans: lis
         document_ids=sorted({span.document_id for span in spans}),
         retrieval_method=spans[0].retrieval_method if spans else "sqlite_fts5_bm25",
     )
+
+
+def scientific_state_snapshot(deps: HarnessDeps) -> dict:
+    """Payload-free scientific facts derived from ArtifactStore; no second state store."""
+    kinds = (
+        "retrieval_candidate_bundle", "evidence_span", "evidence_bundle", "edc_open_triples",
+        "edc_relation_definitions", "ontology_snapshot", "candidate_canonical_triples",
+        "verification_report", "canonical_triples", "partial_result",
+    )
+    observations = {}
+    for kind in kinds:
+        rows = deps.artifacts.list(kind)
+        observations[kind] = {"count": len(rows), "artifact_ids": [row["id"] for row in rows],
+                              "latest_artifact_id": rows[-1]["id"] if rows else None}
+    return {"run_id": deps.run_id, "target_document_id": deps.target_document_id,
+            "document_ids": deps.document_ids, "artifacts": observations}
     return deps.artifacts.put(
         "retrieval_candidate_bundle", bundle,
         label=f"Orientation retrieval candidates: {query}",
@@ -44,7 +60,7 @@ def register_research_tools(agent) -> None:
         return {
             "specialist_capabilities": sorted(SUPPORTED_CAPABILITIES),
             "meta": [
-                "inspect_research_state", "inspect_artifact", "list_artifacts", "record_decision",
+                "inspect_research_state", "inspect_scientific_state", "inspect_artifact", "list_artifacts", "record_decision",
                 "spawn_specialist", "run_specialist_fanout", "run_dynamic_workflow",
                 "orientation_search_documents", "orientation_search_ontology", "persist_partial_result",
             ],
@@ -63,6 +79,12 @@ def register_research_tools(agent) -> None:
         ctx.deps.ensure_not_cancelled()
         run = ctx.deps.registry.get(ctx.deps.run_id)
         return run.state.model_dump(mode="json") if run.state else {}
+
+    @agent.tool
+    async def inspect_scientific_state(ctx: RunContext[HarnessDeps]) -> dict:
+        """Read immutable ArtifactStore facts only; this tool does not recommend a next action."""
+        ctx.deps.ensure_not_cancelled()
+        return scientific_state_snapshot(ctx.deps)
 
     @agent.tool
     async def list_artifacts(ctx: RunContext[HarnessDeps], kind: str | None = None) -> list[dict]:
@@ -85,6 +107,7 @@ def register_research_tools(agent) -> None:
     async def orientation_search_documents(
         ctx: RunContext[HarnessDeps],
         query: str,
+        document_ids: list[str] | None = None,
         limit_per_document: int = 5,
     ) -> dict:
         """
@@ -99,7 +122,11 @@ def register_research_tools(agent) -> None:
 
         rows = []
 
-        for doc_id in ctx.deps.document_ids:
+        selected_ids = document_ids or [ctx.deps.target_document_id]
+        unknown_ids = sorted(set(selected_ids) - set(ctx.deps.document_ids))
+        if unknown_ids:
+            raise ValueError(f"orientation_search_documents accepts selected document IDs only; unknown: {unknown_ids}")
+        for doc_id in selected_ids:
             rows.extend(
                 x.model_dump(mode="json")
                 for x in ctx.deps.retrieval.search(

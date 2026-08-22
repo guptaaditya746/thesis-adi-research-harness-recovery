@@ -10,7 +10,13 @@ from pydantic_ai import Agent, UsageLimits
 
 from app.agents.model_factory import build_model, model_metadata
 from app.agents.toolsets import build_specialist_toolsets
-from app.harness.contracts import validate_specialist_spec
+from app.harness.contracts import (
+    ArtifactIntegrityError,
+    ArtifactNotFound,
+    InvalidArtifactKind,
+    ScientificStateBlocked,
+    validate_specialist_spec,
+)
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import AgentSpec, ModelProfile, RecoveryAction, SpecialistResult
@@ -24,7 +30,12 @@ class AgentFactory:
 
     async def run(self, spec: AgentSpec) -> SpecialistResult:
         self.deps.ensure_not_cancelled()
-        validate_specialist_spec(self.deps, spec)
+        try:
+            validate_specialist_spec(self.deps, spec)
+        except ScientificStateBlocked as exc:
+            return self._blocked_result(spec, exc)
+        except (ArtifactNotFound, InvalidArtifactKind, ArtifactIntegrityError) as exc:
+            return self._blocked_result(spec, exc, status="partial")
         if self.deps.registry.get(self.deps.run_id).state and self.deps.registry.get(self.deps.run_id).state.delegate_calls >= self.deps.settings.max_subagent_calls:
             raise RuntimeError("MAX_SUBAGENT_CALLS budget exhausted")
 
@@ -97,9 +108,10 @@ class AgentFactory:
             except Exception as exc:
                 last_error = exc
                 correctable = self._is_correctable_tool_input_failure(exc)
-                next_profile = None if correctable else (profiles[attempt + 1] if attempt + 1 < len(profiles) else None)
+                scientific_failure = isinstance(exc, (ScientificStateBlocked, ArtifactNotFound, InvalidArtifactKind, ArtifactIntegrityError))
+                next_profile = None if scientific_failure else (profiles[attempt + 1] if attempt + 1 < len(profiles) else None)
                 await self._record_recovery(spec, profile, attempt, exc, next_profile, correctable=correctable)
-                if correctable:
+                if correctable or scientific_failure:
                     break
                 if attempt + 1 < len(profiles):
                     await asyncio.sleep(min(2 ** attempt, 4))
@@ -108,6 +120,7 @@ class AgentFactory:
         self._remove_active(spec.id)
         # Graceful partial specialist result; the Director can change strategy or create a different specialist.
         partial = SpecialistResult(
+            task_status="partial", task_scope=spec.task_scope,
             summary=f"Specialist {spec.role} could not complete reliably.",
             unresolved_questions=[spec.objective],
             recommended_next_actions=["Narrow the task or evidence and re-delegate", "Use an independent specialist with different tools"],
@@ -119,6 +132,24 @@ class AgentFactory:
         partial.artifact_ids.append(ref.id)
         await self.emitter.emit(type="delegate", actor=spec.id, action="specialist_partial", title=f"{spec.role} returned partial result",
                                 status="failed", summary=str(last_error or "unknown failure"), artifact_id=ref.id)
+        return partial
+
+    def _blocked_result(self, spec: AgentSpec, exc: Exception, *, status: str = "blocked") -> SpecialistResult:
+        requirements = tuple(getattr(exc, "requirements", ()))
+        partial = SpecialistResult(
+            task_status=status, task_scope=spec.task_scope,
+            summary=f"Specialist {spec.role} is blocked by scientific state.",
+            unresolved_questions=[spec.objective],
+            recommended_next_actions=["Return control to the Research Director and create the missing state."],
+            blocked_requirements=list(requirements),
+            blocked_reason=str(exc),
+        )
+        ref = self.deps.artifacts.put(
+            "specialist_blocked" if status == "blocked" else "specialist_input_error", partial,
+            label=f"{status.title()}: {spec.role}", creator_agent_id=spec.id,
+            parent_artifact_ids=spec.input_artifact_ids,
+        )
+        partial.artifact_ids.append(ref.id)
         return partial
 
     def build(self, spec: AgentSpec) -> Agent:
@@ -215,6 +246,7 @@ class AgentFactory:
             "You are an ephemeral specialist inside a scientific research harness. You receive isolated narrow context, not the "
             "Research Director's conversation. Use only granted capabilities. Evidence IDs and artifact IDs are scientific provenance. "
             "Do not expose hidden chain-of-thought; provide concise decisions/findings and artifact references. "
+            "task_status describes completion of your assigned task_scope only, not completion of the overall research run. "
             f"Role-specific instructions: {spec.instructions}"
         )
 
@@ -250,6 +282,8 @@ class AgentFactory:
         markers = ("source-resolution", "source resolution", "candidate_id", "EvidenceSpan", "preview text", "input_artifact_ids")
         while current is not None and id(current) not in seen:
             seen.add(id(current))
+            if isinstance(current, (ArtifactNotFound, InvalidArtifactKind)):
+                return True
             if isinstance(current, ValueError) and any(marker.lower() in str(current).lower() for marker in markers):
                 return True
             current = current.__cause__ or current.__context__

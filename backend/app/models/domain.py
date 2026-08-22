@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -27,6 +27,19 @@ def stable_hash(value: Any) -> str:
 SpecialistCapability = Literal[
     "documents", "ontology", "sparql", "edc", "verification",
     "entity_normalization", "artifacts", "shell", "filesystem",
+]
+
+SpecialistStatus = Literal["completed", "partial", "blocked"]
+SpecialistTaskScope = Literal[
+    "evidence_selection", "document_analysis", "ontology_discovery", "ontology_snapshot",
+    "edc_extract", "edc_define", "edc_canonicalize", "verification", "critique", "other",
+]
+ScientificRequirementKind = Literal[
+    "evidence_bundle",
+    "edc_open_triples",
+    "edc_relation_definitions",
+    "ontology_snapshot",
+    "candidate_canonical_triples",
 ]
 
 
@@ -74,6 +87,18 @@ class ArtifactEnvelope(BaseModel):
     content: Any
 
 
+class ArtifactMetadata(BaseModel):
+    """Payload-free immutable metadata used for scientific contract checks."""
+
+    artifact_id: str
+    artifact_type: str
+    run_id: str
+    creator_agent_id: str
+    parent_artifact_ids: list[str] = Field(default_factory=list)
+    schema_version: str = "1.0"
+    content_sha256: str
+
+
 class DecisionRecord(BaseModel):
     id: str = Field(default_factory=lambda: new_id("decision"))
     action: str
@@ -88,6 +113,7 @@ class AgentSpec(BaseModel):
     role: str
     objective: str
     instructions: str
+    task_scope: SpecialistTaskScope = "other"
     required_capabilities: list[SpecialistCapability] = Field(default_factory=list)
     input_artifact_ids: list[str] = Field(default_factory=list)
     output_schema: str = "specialist_result"
@@ -99,6 +125,8 @@ class AgentSpec(BaseModel):
 
 
 class SpecialistResult(BaseModel):
+    task_status: SpecialistStatus = "completed"
+    task_scope: SpecialistTaskScope
     summary: str
     findings: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
@@ -106,6 +134,8 @@ class SpecialistResult(BaseModel):
     unresolved_questions: list[str] = Field(default_factory=list)
     recommended_next_actions: list[str] = Field(default_factory=list)
     decision: DecisionRecord | None = None
+    blocked_requirements: list[ScientificRequirementKind] = Field(default_factory=list)
+    blocked_reason: str | None = None
 
 
 class SourcePosition(BaseModel):
@@ -291,10 +321,16 @@ class SubOntologyArtifact(BaseModel):
     turtle_path: str
     seed_schema_version: str = "2024-06-14"
     selected_elements: list[OntologyElement]
-    dependency_uris: list[str] = Field(default_factory=list)
     proposals: list[OntologyProposal] = Field(default_factory=list)
     validation_warnings: list[str] = Field(default_factory=list)
     content_sha256: str | None = None
+    seed_ontology_sha256: str | None = None
+    selected_dblp_uris: list[str] = Field(default_factory=list)
+    dependency_uris: list[str] = Field(default_factory=list)
+    accepted_proposal_artifact_ids: list[str] = Field(default_factory=list)
+    snapshot_ttl_sha256: str | None = None
+    triple_count: int = 0
+    snapshot_builder_version: str = "ontology-service-v1"
 
 
 class SPARQLArtifact(BaseModel):
@@ -322,8 +358,10 @@ class CandidateTriple(BaseModel):
 
 
 class RelationDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("reldef"))
     relation: str
     definition: str
+    open_triple_ids: list[str] = Field(default_factory=list)
 
 
 class CanonicalRelationCandidate(BaseModel):
@@ -371,6 +409,8 @@ class CanonicalTriple(BaseModel):
     object_type: str | None = None
     original_open_triple: CandidateTriple | None = None
     canonicalization_decision_id: str | None = None
+    relation_definition_id: str | None = None
+    verification_record_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     support_type: SupportType = SupportType.DIRECT
     verification_status: VerificationStatus = VerificationStatus.UNCERTAIN
@@ -380,6 +420,54 @@ class CanonicalTriple(BaseModel):
     producing_agent_id: str = "edc"
     run_id: str | None = None
     canonicalization: Literal["exact", "deterministic_match", "llm_verified", "open_relation"] = "open_relation"
+
+
+class EDCOpenTriples(BaseModel):
+    edc_execution_id: str
+    evidence_bundle_artifact_id: str
+    triples: list[CandidateTriple] = Field(default_factory=list)
+
+
+class EDCRelationDefinitions(BaseModel):
+    edc_execution_id: str
+    open_triples_artifact_id: str
+    definitions: list[RelationDefinition] = Field(default_factory=list)
+
+
+class EDCCanonicalizationResult(BaseModel):
+    edc_execution_id: str
+    open_triples_artifact_id: str
+    relation_definitions_artifact_id: str
+    evidence_bundle_artifact_id: str
+    ontology_snapshot_artifact_id: str
+    candidates: list[CanonicalTriple] = Field(default_factory=list)
+    decisions: list[CanonicalizationDecision] = Field(default_factory=list)
+    unresolved_open_triple_ids: list[str] = Field(default_factory=list)
+    ontology_proposal_artifact_ids: list[str] = Field(default_factory=list)
+
+
+class OntologyAcceptanceDecision(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("ontdec"))
+    proposal_artifact_id: str
+    deciding_actor: str
+    reason: str
+    competing_dblp_candidates: list[str] = Field(default_factory=list)
+    accepted_for_run: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class VerificationRecord(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("vrec"))
+    candidate_triple_id: str
+    evidence_support: Literal["yes", "no", "uncertain"]
+    predicate_semantic_fit: Literal["yes", "no", "uncertain"]
+    direction_correct: Literal["yes", "no", "uncertain"]
+    entity_normalization: Literal["good", "weak", "uncertain"]
+    structural_validity: Literal["yes", "no", "uncertain"]
+    status: VerificationStatus
+    explanation: str
+    evidence_bundle_artifact_id: str
+    ontology_snapshot_artifact_id: str
 
 
 class VerificationDimensions(BaseModel):
@@ -400,6 +488,10 @@ class TripleVerification(BaseModel):
     explanation: str
     evidence_ids: list[str]
     verifier_agent_id: str
+    candidate_artifact_id: str | None = None
+    evidence_bundle_artifact_id: str | None = None
+    ontology_snapshot_artifact_id: str | None = None
+    edc_execution_id: str | None = None
 
 
 class RejectedTriple(BaseModel):
@@ -562,20 +654,49 @@ class PartialResearchResult(BaseModel):
     recommended_recovery_option: str
 
 
-class ResearchConclusion(BaseModel):
+class _ResearchConclusionBase(BaseModel):
     answer: str = ""
     answer_summary: str = ""
-    triple_artifact_id: str | None = None
+    answer_artifact_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     unresolved_issues: list[str] = Field(default_factory=list)
     completion_reason: str
-    status: Literal["completed", "partial"] = "completed"
+
+
+class CompletedResearchConclusion(_ResearchConclusionBase):
+    status: Literal["completed"]
+    triple_artifact_id: str
+
+
+class PartialResearchConclusion(_ResearchConclusionBase):
+    status: Literal["partial"]
+    partial_result_artifact_id: str
+    triple_artifact_id: str | None = None
+
+
+ResearchConclusion = Annotated[
+    CompletedResearchConclusion | PartialResearchConclusion,
+    Field(discriminator="status"),
+]
+
+
+class RunRuntimeIdentity(BaseModel):
+    """Observed execution identity plus optional operator-declared runtime details."""
+
+    run_id: str
+    observed: dict[str, Any] = Field(default_factory=dict)
+    operator_declared: dict[str, Any] = Field(default_factory=dict)
+    prompt_sha256: str
+    tool_schema_sha256: str
+    output_schema_sha256: str
+    document_sha256: dict[str, str] = Field(default_factory=dict)
 
 
 class ExperimentRun(BaseModel):
     id: str = Field(default_factory=lambda: new_id("run"))
     workspace_id: str
     document_ids: list[str]
+    target_document_id: str | None = None
     question: str
     status: Literal["queued", "running", "completed", "partial", "failed", "cancelled"] = "queued"
     active_actor: str | None = None
@@ -589,6 +710,7 @@ class ExperimentRun(BaseModel):
     evaluation: EvaluationResult | None = None
     gold: GoldAnnotation | None = None
     langtrace_trace_id: str | None = None
+    runtime_identity_artifact_ids: list[str] = Field(default_factory=list)
     resumable: bool = False
     error: str | None = None
 
@@ -596,5 +718,6 @@ class ExperimentRun(BaseModel):
 class StartRunRequest(BaseModel):
     workspace_id: str = "default"
     document_ids: list[str]
+    target_document_id: str | None = None
     question: str
     gold: GoldAnnotation | None = None

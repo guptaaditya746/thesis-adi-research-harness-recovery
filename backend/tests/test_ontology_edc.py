@@ -28,6 +28,9 @@ def test_valid_extension_is_run_local(settings, tmp_path: Path):
     snapshot = service.build_snapshot([], [proposal], tmp_path / "active.ttl", run_id="r1")
     assert not snapshot.validation_warnings
     assert any(x.uri == uri for x in service.relation_catalog(snapshot))
+    assert snapshot.seed_ontology_sha256 == service.seed_sha256
+    assert snapshot.snapshot_ttl_sha256 == snapshot.content_sha256
+    assert snapshot.snapshot_builder_version
 
 
 def test_edc_candidate_ranking_is_deterministic_non_embedding(settings):

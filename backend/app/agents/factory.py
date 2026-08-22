@@ -172,8 +172,6 @@ class AgentFactory:
         """Host-enforced dynamic fan-out over runtime-generated specialist specs."""
         if not specs:
             return []
-        for spec in specs:
-            validate_specialist_spec(self.deps, spec)
         remaining = self.deps.settings.max_subagent_calls - (self.deps.registry.get(self.deps.run_id).state.delegate_calls if self.deps.registry.get(self.deps.run_id).state else 0)
         specs = specs[:max(0, remaining)]
         return await asyncio.gather(*(self.run(s) for s in specs))

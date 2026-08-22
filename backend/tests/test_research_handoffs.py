@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +7,7 @@ from pydantic import ValidationError
 from app.agents.factory import AgentFactory
 from app.agents.toolsets import persist_candidate_evidence_from_bundle, read_retrieval_candidate_bundle
 from app.harness.contracts import validate_specialist_spec
-from app.models.domain import AgentSpec, EvidenceBundle, EvidenceSpan, RetrievalCandidateBundle
+from app.models.domain import AgentSpec, EvidenceBundle, EvidenceSpan, RetrievalCandidateBundle, SpecialistResult
 from app.storage.artifacts import ArtifactStore
 from app.tools.research import persist_retrieval_candidate_bundle
 
@@ -201,6 +202,27 @@ def test_verification_requires_candidate_triples_and_evidence(settings):
         deps,
         make_spec(required_capabilities=["verification"], input_artifact_ids=[evidence_ref.id, candidate_ref.id]),
     )
+
+
+def test_missing_verification_state_returns_blocked_specialist_result(settings):
+    store = ArtifactStore(settings, "run_blocked_specialist")
+    deps = SimpleNamespace(
+        settings=settings,
+        artifacts=store,
+        ensure_not_cancelled=lambda: None,
+    )
+    factory = AgentFactory.__new__(AgentFactory)
+    factory.deps = deps
+    expected = SpecialistResult(
+        task_status="blocked", task_scope="verification", summary="blocked",
+        blocked_requirements=["candidate_canonical_triples"],
+    )
+    factory._blocked_result = lambda spec, exc, **kwargs: expected
+
+    result = asyncio.run(factory.run(make_spec(task_scope="verification", required_capabilities=["verification"])))
+
+    assert result.task_status == "blocked"
+    assert result.blocked_requirements == ["candidate_canonical_triples"]
 
 
 def test_candidate_lineage_resolves_exact_scientific_inputs(settings):

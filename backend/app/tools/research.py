@@ -7,7 +7,7 @@ from pydantic_ai import Agent, RunContext, UsageLimits
 from app.agents.factory import AgentFactory
 from app.agents.model_factory import build_model
 from app.agents.toolsets import SUPPORTED_CAPABILITIES
-from app.harness.contracts import validate_specialist_spec
+from app.harness.contracts import ScientificStateBlocked
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import (
@@ -176,9 +176,8 @@ def register_research_tools(agent) -> None:
 
     @agent.tool
     async def spawn_specialist(ctx: RunContext[HarnessDeps], spec: AgentSpec) -> dict:
-        """Create one isolated ephemeral PydanticAI specialist from this runtime-generated AgentSpec."""
+        """Create a specialist; missing scientific state returns a typed blocked task result."""
         ctx.deps.ensure_not_cancelled()
-        validate_specialist_spec(ctx.deps, spec)
         output = await AgentFactory(ctx.deps).run(spec)
         return output.model_dump(mode="json")
 
@@ -186,8 +185,6 @@ def register_research_tools(agent) -> None:
     async def run_specialist_fanout(ctx: RunContext[HarnessDeps], specs: list[AgentSpec]) -> list[dict]:
         """Dynamically fan out independent specialists; each receives isolated context/toolsets."""
         ctx.deps.ensure_not_cancelled()
-        for spec in specs:
-            validate_specialist_spec(ctx.deps, spec)
         outputs = await AgentFactory(ctx.deps).run_fanout(specs)
         return [x.model_dump(mode="json") for x in outputs]
 
@@ -196,10 +193,13 @@ def register_research_tools(agent) -> None:
         if not specs:
             raise ValueError("Dynamic workflow requires at least one runtime-generated AgentSpec")
         ctx.deps.ensure_not_cancelled()
-        for spec in specs:
-            validate_specialist_spec(ctx.deps, spec)
         factory = AgentFactory(ctx.deps)
-        workflow = factory.build_workflow_capability(specs)
+        try:
+            workflow = factory.build_workflow_capability(specs)
+        except ScientificStateBlocked:
+            # A workflow cannot begin with unmet scientific prerequisites. Return
+            # the same typed blocked results as ordinary specialist delegation.
+            return {"mode": "host_fanout", "results": [x.model_dump(mode="json") for x in await factory.run_fanout(specs)]}
         if workflow is None:
             # Configured fallback preserves dynamic specialists without making DynamicWorkflow mandatory.
             return {"mode": "host_fanout", "results": [x.model_dump(mode="json") for x in await factory.run_fanout(specs)]}

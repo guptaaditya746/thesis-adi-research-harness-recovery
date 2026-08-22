@@ -15,7 +15,7 @@ from app.models.domain import (
     DecisionRecord,
     EvidenceSpan,
     ModelProfile,
-    PartialResearchResult,
+    IncompleteResearchState,
     RetrievalCandidateBundle,
     RetrievalCandidatePreview,
     SpecialistResult,
@@ -41,7 +41,7 @@ def scientific_state_snapshot(deps: HarnessDeps) -> dict:
     kinds = (
         "retrieval_candidate_bundle", "evidence_span", "evidence_bundle", "edc_open_triples",
         "edc_relation_definitions", "ontology_snapshot", "candidate_canonical_triples",
-        "verification_report", "canonical_triples", "partial_result",
+        "verification", "canonical_triples", "completion_attempt", "incomplete_research_state", "failure_record",
     )
     observations = {}
     for kind in kinds:
@@ -62,7 +62,7 @@ def register_research_tools(agent) -> None:
             "meta": [
                 "inspect_research_state", "inspect_scientific_state", "inspect_artifact", "list_artifacts", "record_decision",
                 "spawn_specialist", "run_specialist_fanout", "run_dynamic_workflow",
-                "orientation_search_documents", "orientation_search_ontology", "persist_partial_result",
+                "orientation_search_documents", "orientation_search_ontology", "persist_incomplete_research_state", "attempt_complete_research",
             ],
             "budgets": {
                 "max_agent_steps": ctx.deps.settings.max_agent_steps,
@@ -229,11 +229,25 @@ def register_research_tools(agent) -> None:
                 "result": result.output.model_dump(mode="json")}
 
     @agent.tool
-    async def persist_partial_result(ctx: RunContext[HarnessDeps], partial: PartialResearchResult) -> dict:
-        """Gracefully terminate with typed partial findings instead of hallucinating success."""
-        partial_ref = ctx.deps.artifacts.put("partial_result", partial, label="Graceful partial research result", creator_agent_id="research_director")
-        triples_ref = ctx.deps.artifacts.put("canonical_triples", [], label="Accepted canonical triples (partial run)",
-                                             creator_agent_id="research_director", parent_artifact_ids=[partial_ref.id])
-        rejected_ref = ctx.deps.artifacts.put("rejected_triples", [], creator_agent_id="research_director", parent_artifact_ids=[partial_ref.id])
-        return {"partial_ref": partial_ref.model_dump(mode="json"), "canonical_triples_ref": triples_ref.model_dump(mode="json"),
-                "rejected_triples_ref": rejected_ref.model_dump(mode="json")}
+    async def persist_incomplete_research_state(ctx: RunContext[HarnessDeps], incomplete: IncompleteResearchState) -> dict:
+        """Persist diagnostic incomplete state only; this never completes the scientific run."""
+        ref = ctx.deps.artifacts.put("incomplete_research_state", incomplete,
+                                     label="Incomplete research diagnostic", creator_agent_id="research_director")
+        return {"artifact_ref": ref.model_dump(mode="json")}
+
+    @agent.tool
+    async def attempt_complete_research(ctx: RunContext[HarnessDeps], canonical_triples_artifact_id: str) -> dict:
+        """Validate a claimed scientific completion and return only factual state when it is not yet valid."""
+        ctx.deps.ensure_not_cancelled()
+        attempt = ctx.deps.completion.attempt(ctx.deps, canonical_triples_artifact_id)
+        parents = [canonical_triples_artifact_id] if canonical_triples_artifact_id in {x["id"] for x in ctx.deps.artifacts.list()} else []
+        ref = ctx.deps.artifacts.put("completion_attempt", attempt, creator_agent_id="research_director",
+                                     parent_artifact_ids=parents)
+        await TraceEmitter(ctx.deps.registry, ctx.deps.run_id, ctx.deps.telemetry).emit(
+            type="validation", actor="research_director",
+            action="completion_attempt_accepted" if attempt.accepted else "completion_attempt_rejected",
+            title="Scientific completion accepted" if attempt.accepted else "Scientific completion rejected",
+            status="completed" if attempt.accepted else "info", artifact_id=ref.id,
+            payload=attempt.model_dump(mode="json"),
+        )
+        return attempt.model_dump(mode="json")

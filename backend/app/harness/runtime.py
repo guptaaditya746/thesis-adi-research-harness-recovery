@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai import Agent, ModelRetry, UsageLimits
+from pydantic_ai import Agent, UsageLimits
 from pydantic import TypeAdapter
 
 from app.agents.model_factory import build_model
@@ -17,10 +17,10 @@ from app.harness.capabilities import build_director_capabilities
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import (
-    CanonicalTriple, ExperimentRun, PartialResearchConclusion, RejectedTriple, ResearchConclusion, ResearchState,
+    CanonicalTriple, ExperimentRun, FailureRecord, RejectedTriple, ResearchConclusion, ResearchState,
     RunRuntimeIdentity, stable_hash,
 )
-from app.harness.contracts import resolve_candidate_lineage, ScientificStateBlocked
+from app.harness.completion import ScientificCompletionService
 from app.services.edc import EDCService
 from app.services.entities import EntityNormalizationService
 from app.services.evaluation import EvaluationService
@@ -77,13 +77,13 @@ Scientific invariants:
 - Specialists are isolated, bounded, and should receive narrow tasks/artifact IDs/tool capabilities.
 - Use independent verification when facts/canonicalization are uncertain. Reject/mark uncertain rather than hallucinating.
 - Recovery is expected: repair structured/tool errors, narrow context, decompose, re-delegate, use an independent critic,
-  escalate model profile, change search strategy, or return a typed partial result when reliable completion is impossible.
+  escalate model profile, or change search strategy. If resources end before scientific completion, the run fails with diagnostics.
 - Do not expose hidden chain-of-thought. Make the research auditable with task messages, generated specialist prompts,
   DecisionRecord summaries, tool calls/results, retries/recovery actions, and immutable artifacts.
 
 There is no mandatory order. An easy question may only need retrieval -> EDC -> verification; a hard question may revisit
-ontology/retrieval/critics several times. Before a completed terminal answer, ensure a `canonical_triples` artifact exists.
-If reliable completion is impossible, use `persist_partial_result` and return status=partial rather than inventing success.
+ontology/retrieval/critics several times. When you believe research is complete, call `attempt_complete_research` with the
+canonical_triples artifact ID. A rejected attempt returns factual state only; choose the next action yourself.
 """
 
 
@@ -99,6 +99,7 @@ class ResearchHarness:
         self.entities = EntityNormalizationService()
         self.verification = TripleVerificationService(settings)
         self.validation = StructuralValidationService()
+        self.completion = ScientificCompletionService()
         self.evaluation = EvaluationService()
         self.telemetry = telemetry or Telemetry(settings)
 
@@ -130,14 +131,15 @@ class ResearchHarness:
             target_document_id=target_document_id,
             artifacts=artifacts, registry=self.registry, pdf=self.pdf, retrieval=self.retrieval,
             ontology=self.ontology, sparql=self.sparql, edc=self.edc, entities=self.entities,
-            verification=self.verification, validation=self.validation, evaluation=self.evaluation, telemetry=self.telemetry,
+            verification=self.verification, validation=self.validation, evaluation=self.evaluation,
+            completion=self.completion, telemetry=self.telemetry,
         )
         capabilities, step_store = build_director_capabilities(self.settings, workspace, run.id)
         director = Agent(
-            build_model(self.settings, "balanced"), deps_type=HarnessDeps, output_type=ResearchConclusion,
+            build_model(self.settings, "balanced"), deps_type=HarnessDeps, output_type=str,
             name="research_director", description="Goal-oriented thesis Research Director with runtime specialist creation.",
             instructions=DIRECTOR_INSTRUCTIONS, capabilities=capabilities,
-            retries={"tools": self.settings.llm_output_retries, "output": self.settings.llm_output_retries},
+            retries={"tools": self.settings.llm_output_retries},
             model_settings={"temperature": self.settings.llm_temperature, "max_tokens": self.settings.llm_max_tokens},
         )
         register_research_tools(director)
@@ -147,66 +149,6 @@ class ResearchHarness:
         identity_ref = self._persist_runtime_identity(run, artifacts, initial_prompt)
         run.runtime_identity_artifact_ids.append(identity_ref.id)
         self.registry.persist(run)
-
-        @director.output_validator
-        async def completion_gate(ctx, output: ResearchConclusion) -> ResearchConclusion:
-            if isinstance(output, PartialResearchConclusion):
-                try:
-                    partial_meta = ctx.deps.artifacts.get_metadata(output.partial_result_artifact_id)
-                except KeyError as exc:
-                    raise ModelRetry("Partial output requires a persisted partial_result artifact ID.") from exc
-                if partial_meta.artifact_type != "partial_result":
-                    raise ModelRetry("partial_result_artifact_id must reference a partial_result artifact.")
-                return output
-            final_meta = ctx.deps.artifacts.find_latest("canonical_triples")
-            if not final_meta:
-                raise ModelRetry(
-                    "Terminal output is not auditable yet. Persist accepted canonical triples with verification, or call "
-                    "persist_partial_result to create an explicit empty/partial final triple artifact."
-                )
-            candidate_id = next((x for x in final_meta.get("parent_artifact_ids", []) if ctx.deps.artifacts.get_metadata(x).artifact_type == "candidate_canonical_triples"), None)
-            if not candidate_id:
-                raise ModelRetry("Final canonical_triples must be created by verification from candidate_canonical_triples.")
-            try:
-                lineage = resolve_candidate_lineage(ctx.deps, candidate_id)
-            except ScientificStateBlocked as exc:
-                raise ModelRetry(str(exc)) from exc
-            parents = set(final_meta.get("parent_artifact_ids", []))
-            if not {lineage.evidence_bundle_id, lineage.ontology_snapshot_id}.issubset(parents):
-                raise ModelRetry("Final canonical_triples must retain the exact evidence_bundle and ontology_snapshot lineage.")
-            try:
-                triples = [CanonicalTriple.model_validate(x) for x in ctx.deps.artifacts.get(final_meta["id"])]
-            except Exception as exc:
-                raise ModelRetry("The persisted canonical_triples artifact violates its stored schema.") from exc
-            for triple in triples:
-                if not triple.evidence_ids:
-                    raise ModelRetry(f"Triple {triple.id} has no evidence IDs and cannot be accepted.")
-                if not triple.predicate_uri or triple.canonicalization == "open_relation":
-                    raise ModelRetry(f"Triple {triple.id} still has an open/non-canonical predicate; resolve/reject it before finishing.")
-                if triple.verification_status != "accepted":
-                    raise ModelRetry(f"Triple {triple.id} is not independently accepted; verify or reject it before finishing.")
-                for evidence_id in triple.evidence_ids:
-                    try:
-                        raw = ctx.deps.artifacts.get(evidence_id)
-                    except KeyError:
-                        raise ModelRetry(f"Evidence {evidence_id} does not resolve to an immutable evidence_span artifact.")
-                    from app.models.domain import EvidenceSpan
-                    span = EvidenceSpan.model_validate(raw)
-                    ok, reason = ctx.deps.retrieval.validate_span(ctx.deps.pdf.load(span.document_id), span)
-                    if not ok:
-                        raise ModelRetry(f"Evidence integrity failed for {evidence_id}: {reason}")
-            rendered = self._render_answer(triples)
-            answer_ref = ctx.deps.artifacts.put(
-                "research_answer", {"answer": rendered, "triple_artifact_id": final_meta["id"]},
-                creator_agent_id="research_harness", parent_artifact_ids=[final_meta["id"]],
-                artifact_id=f"answer_{final_meta['id']}",
-            )
-            output.answer = rendered
-            output.answer_summary = f"{len(triples)} accepted canonical triples grounded in the verified research artifact."
-            output.answer_artifact_id = answer_ref.id
-            if output.triple_artifact_id != final_meta["id"]:
-                raise ModelRetry(f"Use the final canonical_triples artifact id {final_meta['id']} in triple_artifact_id.")
-            return output
 
         event_handler = make_pydantic_event_handler(self.registry, run.id, self.telemetry, "research_director")
         message_history = None
@@ -242,8 +184,18 @@ class ResearchHarness:
                     ),
                     timeout=self.settings.max_run_seconds,
                 )
-                conclusion = result.output
-                root_span.set_attribute("research.completion_status", conclusion.status)
+                attempt = self._latest_accepted_completion(artifacts)
+                if attempt is None:
+                    self._record_failed_completion(
+                        run.id, artifacts,
+                        "Director ended without an accepted scientific completion attempt.",
+                    )
+                    await emitter.emit(type="run", actor="research_harness", action="incomplete_failure",
+                                       title="Research run failed", status="failed",
+                                       summary="No accepted scientific completion attempt was recorded.")
+                    return
+                conclusion = self._conclusion_from_completion(attempt, artifacts)
+                root_span.set_attribute("research.completion_status", "completed")
 
             self._finalize_success(run.id, conclusion, artifacts)
             await emitter.emit(
@@ -258,18 +210,14 @@ class ResearchHarness:
             await emitter.emit(type="run", actor="research_harness", action="cancel", title="Research run cancelled", status="failed")
             raise
         except asyncio.TimeoutError:
-            if artifacts.find_latest("canonical_triples"):
-                self._finalize_existing_partial(run.id, artifacts, "Run time budget exhausted after producing an auditable partial result.")
-                await emitter.emit(type="run", actor="research_harness", action="timeout_partial", title="Run ended with partial result", status="completed")
-            else:
-                self._mark_terminal(run.id, "failed", "MAX_RUN_SECONDS budget exhausted before an auditable result was persisted")
-                await emitter.emit(type="run", actor="research_harness", action="timeout", title="Research run timed out", status="failed")
+            self._record_failed_completion(run.id, artifacts, "MAX_RUN_SECONDS budget exhausted before accepted scientific completion.", "TimeoutError")
+            await emitter.emit(type="run", actor="research_harness", action="timeout", title="Research run timed out", status="failed")
         except Exception as exc:
             if self.registry.is_cancelled(run.id):
                 self._mark_terminal(run.id, "cancelled", str(exc))
                 await emitter.emit(type="run", actor="research_harness", action="cancel", title="Research run cancelled", status="failed")
             else:
-                self._mark_terminal(run.id, "failed", f"{type(exc).__name__}: {exc}")
+                self._record_failed_completion(run.id, artifacts, f"{type(exc).__name__}: {exc}", type(exc).__name__)
                 await emitter.emit(type="run", actor="research_harness", action="error", title="Research run failed",
                                    status="failed", summary=f"{type(exc).__name__}: {exc}")
 
@@ -297,6 +245,45 @@ class ResearchHarness:
         self._evaluate(run, artifacts)
         self.registry.persist(run)
 
+    def _latest_accepted_completion(self, artifacts: ArtifactStore):
+        from app.models.domain import CompletionAttempt
+        for meta in reversed(artifacts.list("completion_attempt")):
+            try:
+                attempt = CompletionAttempt.model_validate(artifacts.get(meta["id"]))
+            except Exception:
+                continue
+            if attempt.accepted and attempt.canonical_triples_artifact_id:
+                return attempt
+        return None
+
+    def _conclusion_from_completion(self, attempt, artifacts: ArtifactStore) -> ResearchConclusion:
+        triples = [CanonicalTriple.model_validate(item) for item in artifacts.get(attempt.canonical_triples_artifact_id)]
+        rendered = self._render_answer(triples)
+        answer_ref = artifacts.put(
+            "research_answer", {"answer": rendered, "triple_artifact_id": attempt.canonical_triples_artifact_id},
+            creator_agent_id="research_harness", parent_artifact_ids=[attempt.canonical_triples_artifact_id],
+            artifact_id=f"answer_{attempt.canonical_triples_artifact_id}",
+        )
+        return ResearchConclusion(
+            answer=rendered,
+            answer_summary=f"{len(triples)} accepted canonical triples grounded in the verified research artifact.",
+            answer_artifact_id=answer_ref.id,
+            evidence_ids=sorted({evidence_id for triple in triples for evidence_id in triple.evidence_ids}),
+            completion_reason="Scientific completion was independently validated by the host.",
+            triple_artifact_id=attempt.canonical_triples_artifact_id,
+        )
+
+    def _record_failed_completion(self, run_id: str, artifacts: ArtifactStore, reason: str, error_type: str | None = None) -> None:
+        record = FailureRecord(
+            terminal_reason=reason,
+            error_type=error_type,
+            scientific_state=self.completion.scientific_state(artifacts),
+            artifact_ids=[item["id"] for item in artifacts.list()],
+        )
+        artifacts.put("failure_record", record, label="Strict scientific completion failure", creator_agent_id="research_harness")
+        self._mark_terminal(run_id, "failed", reason)
+        self._evaluate(self.registry.get(run_id), artifacts)
+
     @staticmethod
     def _render_answer(triples: list[CanonicalTriple]) -> str:
         if not triples:
@@ -304,19 +291,6 @@ class ResearchHarness:
         lines = ["Verified findings:"]
         lines.extend(f"- {t.subject} — {t.predicate} — {t.object}" for t in triples)
         return "\n".join(lines)
-
-    def _finalize_existing_partial(self, run_id: str, artifacts: ArtifactStore, reason: str) -> None:
-        run = self.registry.get(run_id)
-        final_meta = artifacts.find_latest("canonical_triples")
-        run.final_triples = [CanonicalTriple.model_validate(x) for x in artifacts.get(final_meta["id"])] if final_meta else []
-        run.status = "partial"
-        run.resumable = False
-        run.active_actor = None
-        run.error = reason
-        if run.state:
-            run.state.status = "partial"
-        self._evaluate(run, artifacts)
-        self.registry.persist(run)
 
     def _evaluate(self, run: ExperimentRun, artifacts: ArtifactStore) -> None:
         validation_meta = artifacts.find_latest("structural_validation")
@@ -327,6 +301,16 @@ class ResearchHarness:
             except Exception:
                 pass
         events = self.registry.events(run.id)
+        artifact_kinds = {item["kind"] for item in artifacts.list()}
+        rejected_indices = [index for index, event in enumerate(events) if event.action == "completion_attempt_rejected"]
+        actions_after_rejection = sum(
+            event.type == "tool" and event.status == "started" and event.action != "attempt_complete_research"
+            for index, event in enumerate(events)
+            if rejected_indices and index > rejected_indices[-1]
+        )
+        started_actions = [event.action for event in events if event.type == "tool" and event.status == "started"]
+        repeated_invalid = sum(left == right for left, right in zip(started_actions, started_actions[1:]))
+        error_text = (run.error or "").lower()
         run.evaluation = self.evaluation.evaluate(
             run.final_triples, shacl_conforms=shacl, gold=run.gold,
             rejected_count=len(run.rejected_triples),
@@ -334,6 +318,17 @@ class ResearchHarness:
             subagents_spawned=sum(x.action == "spawn_specialist" for x in events),
             retries=sum(x.type == "recovery" for x in events),
             model_escalations=sum(x.type == "recovery" and x.action == "model_escalation" for x in events),
+            completion_attempts=sum(x.action in {"completion_attempt_accepted", "completion_attempt_rejected"} for x in events),
+            rejected_completion_attempts=len(rejected_indices),
+            actions_after_rejected_completion=actions_after_rejection,
+            edc_reached=bool({"edc_open_triples", "edc_relation_definitions", "edc_canonicalization"} & artifact_kinds),
+            ontology_inspected=any(x.action in {"orientation_search_ontology", "search_ontology", "inspect_ontology_term"} for x in events),
+            ontology_snapshot_created="ontology_snapshot" in artifact_kinds,
+            candidate_triples_produced="candidate_canonical_triples" in artifact_kinds,
+            verification_reached="verification" in artifact_kinds,
+            canonical_triples_produced="canonical_triples" in artifact_kinds,
+            repeated_invalid_actions=repeated_invalid,
+            resource_exhausted="budget exhausted" in error_text or "contextwindowexceeded" in error_text,
         )
         artifacts.put("evaluation", run.evaluation, label="Run evaluation", creator_agent_id="research_harness")
 

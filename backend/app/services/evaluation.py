@@ -17,6 +17,17 @@ class EvaluationService:
         subagents_spawned: int = 0,
         retries: int = 0,
         model_escalations: int = 0,
+        completion_attempts: int = 0,
+        rejected_completion_attempts: int = 0,
+        actions_after_rejected_completion: int = 0,
+        edc_reached: bool = False,
+        ontology_inspected: bool = False,
+        ontology_snapshot_created: bool = False,
+        candidate_triples_produced: bool = False,
+        verification_reached: bool = False,
+        canonical_triples_produced: bool = False,
+        repeated_invalid_actions: int = 0,
+        resource_exhausted: bool = False,
     ) -> EvaluationResult:
         result = EvaluationResult(
             provenance_coverage=(sum(bool(t.evidence_ids) for t in triples) / len(triples)) if triples else 0.0,
@@ -26,6 +37,17 @@ class EvaluationService:
             subagents_spawned=subagents_spawned,
             retries=retries,
             model_escalations=model_escalations,
+            completion_attempts=completion_attempts,
+            rejected_completion_attempts=rejected_completion_attempts,
+            actions_after_rejected_completion=actions_after_rejected_completion,
+            edc_reached=edc_reached,
+            ontology_inspected=ontology_inspected,
+            ontology_snapshot_created=ontology_snapshot_created,
+            candidate_triples_produced=candidate_triples_produced,
+            verification_reached=verification_reached,
+            canonical_triples_produced=canonical_triples_produced,
+            repeated_invalid_actions=repeated_invalid_actions,
+            resource_exhausted=resource_exhausted,
         )
         if not gold or not gold.triples:
             result.notes.append("No gold triples supplied; extraction P/R/F1 not computed.")

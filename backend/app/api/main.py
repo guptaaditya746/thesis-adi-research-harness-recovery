@@ -217,7 +217,7 @@ async def run_events(run_id: str):
         queue = registry.queues.setdefault(run_id, asyncio.Queue())
         while True:
             current = registry.get(run_id)
-            if current.status in {"completed", "partial", "failed", "cancelled"} and queue.empty():
+            if current.status in {"completed", "failed", "cancelled"} and queue.empty():
                 yield "data: [DONE]\n\n"
                 break
             try:

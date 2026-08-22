@@ -510,7 +510,7 @@ export function ResearchConsole() {
                 <div>
                   <b>Experiment run history</b>
                   <span>
-                    completed · partial · failed · cancelled · resumable
+                    completed · failed · cancelled · resumable
                   </span>
                 </div>
               </div>

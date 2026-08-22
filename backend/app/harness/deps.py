@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from app.config import Settings
 from app.services.edc import EDCService
+from app.harness.completion import ScientificCompletionService
 from app.services.entities import EntityNormalizationService
 from app.services.evaluation import EvaluationService
 from app.services.ontology import OntologyService
@@ -35,6 +36,7 @@ class HarnessDeps:
     verification: TripleVerificationService
     validation: StructuralValidationService
     evaluation: EvaluationService
+    completion: ScientificCompletionService
     telemetry: Telemetry
 
     def ensure_not_cancelled(self) -> None:

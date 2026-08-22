@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -562,6 +562,17 @@ class EvaluationResult(BaseModel):
     subagents_spawned: int = 0
     retries: int = 0
     model_escalations: int = 0
+    completion_attempts: int = 0
+    rejected_completion_attempts: int = 0
+    actions_after_rejected_completion: int = 0
+    edc_reached: bool = False
+    ontology_inspected: bool = False
+    ontology_snapshot_created: bool = False
+    candidate_triples_produced: bool = False
+    verification_reached: bool = False
+    canonical_triples_produced: bool = False
+    repeated_invalid_actions: int = 0
+    resource_exhausted: bool = False
     notes: list[str] = Field(default_factory=list)
 
 
@@ -643,41 +654,52 @@ class ResearchState(BaseModel):
     model_calls: int = 0
     tool_calls: int = 0
     delegate_calls: int = 0
-    status: Literal["queued", "running", "completed", "partial", "failed", "cancelled"] = "queued"
+    status: Literal["queued", "running", "completed", "failed", "cancelled"] = "queued"
 
 
-class PartialResearchResult(BaseModel):
-    supported_findings: list[str] = Field(default_factory=list)
+class IncompleteResearchState(BaseModel):
+    """Diagnostic state only; never a scientific terminal conclusion."""
+
+    findings: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
-    rejected_triple_ids: list[str] = Field(default_factory=list)
-    failure_reason: str
-    recommended_recovery_option: str
+    reason: str
 
 
-class _ResearchConclusionBase(BaseModel):
+class ScientificStateSnapshot(BaseModel):
+    evidence_bundle: bool = False
+    edc_open_triples: bool = False
+    edc_relation_definitions: bool = False
+    ontology_snapshot: bool = False
+    candidate_canonical_triples: bool = False
+    verification_report: bool = False
+    canonical_triples: bool = False
+
+
+class CompletionAttempt(BaseModel):
+    accepted: bool
+    reason: str
+    canonical_triples_artifact_id: str | None = None
+    scientific_state: ScientificStateSnapshot
+
+
+class FailureRecord(BaseModel):
+    terminal_reason: str
+    scientific_state: ScientificStateSnapshot
+    artifact_ids: list[str] = Field(default_factory=list)
+    error_type: str | None = None
+
+
+class ResearchConclusion(BaseModel):
+    """A successful, independently verified scientific completion only."""
+
     answer: str = ""
     answer_summary: str = ""
     answer_artifact_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     unresolved_issues: list[str] = Field(default_factory=list)
     completion_reason: str
-
-
-class CompletedResearchConclusion(_ResearchConclusionBase):
-    status: Literal["completed"]
     triple_artifact_id: str
-
-
-class PartialResearchConclusion(_ResearchConclusionBase):
-    status: Literal["partial"]
-    partial_result_artifact_id: str
-    triple_artifact_id: str | None = None
-
-
-ResearchConclusion = Annotated[
-    CompletedResearchConclusion | PartialResearchConclusion,
-    Field(discriminator="status"),
-]
+    status: Literal["completed"] = "completed"
 
 
 class RunRuntimeIdentity(BaseModel):
@@ -698,7 +720,7 @@ class ExperimentRun(BaseModel):
     document_ids: list[str]
     target_document_id: str | None = None
     question: str
-    status: Literal["queued", "running", "completed", "partial", "failed", "cancelled"] = "queued"
+    status: Literal["queued", "running", "completed", "failed", "cancelled"] = "queued"
     active_actor: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

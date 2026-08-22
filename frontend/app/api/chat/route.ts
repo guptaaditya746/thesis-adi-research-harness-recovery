@@ -44,9 +44,7 @@ export async function POST(req: Request) {
       }
       const finalRes=await fetch(`${backend}/api/runs/${run.id}`,{cache:'no-store'}); const finalRun=finalRes.ok?await finalRes.json():{status:'failed',error:'Could not load terminal run'};
       if(!textStarted){
-        const fallback = finalRun.final_answer || (finalRun.status==='partial'
-          ? `The research run produced a partial result. ${finalRun.error??'Inspect the retained artifacts and unresolved issues.'}`
-          : `The research run ended with status ${finalRun.status}. ${finalRun.error??'Inspect the trace for the failure point.'}`);
+        const fallback = finalRun.final_answer || `The research run ended with status ${finalRun.status}. ${finalRun.error??'Inspect the trace and failure record.'}`;
         writer.write({type:'text-start',id:textId}); writer.write({type:'text-delta',id:textId,delta:fallback}); writer.write({type:'text-end',id:textId});
       }
       writer.write({ type:'data-run', id:`run-${run.id}-end`, data:{runId:run.id,status:finalRun.status} });

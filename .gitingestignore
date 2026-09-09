@@ -9,7 +9,7 @@
 **/.ruff_cache/
 **/.coverage
 **/htmlcov/
-
+**/uv.lock
 # Runtime corpus, durable runs, uploads, and immutable artifacts
 backend/data/
 backend/**/artifacts/
@@ -29,7 +29,7 @@ backend/**/page_*.txt
 .DS_Store
 .idea/
 .vscode/
-
+uv.lo
 # Packaging and tool caches
 **/.turbo/
 **/.cache/

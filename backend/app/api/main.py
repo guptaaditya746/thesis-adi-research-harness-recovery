@@ -14,6 +14,7 @@ from app.harness.runtime import ResearchHarness
 from app.models.domain import ExperimentRun, StartRunRequest
 from app.services.durability import describe_backend
 from app.services.pdf import PDFService
+from app.services.simple_research import SimpleResearchRequest, SimpleResearchService
 from app.services.triple_map import TripleMapService
 from app.services.workspaces import WorkspaceService
 from app.storage.artifacts import ArtifactStore
@@ -26,9 +27,11 @@ telemetry = Telemetry(settings)
 register_application_telemetry(telemetry)
 harness = ResearchHarness(settings, registry, telemetry=telemetry)
 pdf = PDFService(settings)
+simple_research = SimpleResearchService(settings, pdf)
 triple_map = TripleMapService()
 workspaces = WorkspaceService(settings)
 _tasks: dict[str, asyncio.Task[None]] = {}
+_simple_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 def _schedule(run_id: str, *, resume: bool = False) -> None:
@@ -40,6 +43,15 @@ def _schedule(run_id: str, *, resume: bool = False) -> None:
     task.add_done_callback(lambda _: _tasks.pop(run_id, None))
 
 
+def _schedule_simple(run_id: str) -> None:
+    existing = _simple_tasks.get(run_id)
+    if existing and not existing.done():
+        return
+    task = asyncio.create_task(simple_research.execute(run_id), name=f"simple-research:{run_id}")
+    _simple_tasks[run_id] = task
+    task.add_done_callback(lambda _: _simple_tasks.pop(run_id, None))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # A process restart leaves durable SQLite/run sidecars intact. Resume only runs that
@@ -47,6 +59,7 @@ async def lifespan(_: FastAPI):
     for run in registry.recoverable():
         if run.status == "running" and run.resumable:
             _schedule(run.id, resume=True)
+    simple_research.store.mark_interrupted_failed()
     try:
         yield
     finally:
@@ -211,22 +224,25 @@ async def run_events(run_id: str):
 
     async def stream():
         sent: set[str] = set()
-        for event in registry.events(run_id):
-            sent.add(event.id)
-            yield f"data: {event.model_dump_json()}\n\n"
-        queue = registry.queues.setdefault(run_id, asyncio.Queue())
-        while True:
-            current = registry.get(run_id)
-            if current.status in {"completed", "failed", "cancelled"} and queue.empty():
-                yield "data: [DONE]\n\n"
-                break
-            try:
-                event = await asyncio.wait_for(queue.get(), 15)
-                if event.id not in sent:
-                    sent.add(event.id)
-                    yield f"data: {event.model_dump_json()}\n\n"
-            except asyncio.TimeoutError:
-                yield ": keep-alive\n\n"
+        history, queue = registry.subscribe(run_id)
+        try:
+            for event in history:
+                sent.add(event.id)
+                yield f"data: {event.model_dump_json()}\n\n"
+            while True:
+                current = registry.get(run_id)
+                if current.status in {"completed", "failed", "cancelled"} and queue.empty():
+                    yield "data: [DONE]\n\n"
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), 15)
+                    if event.id not in sent:
+                        sent.add(event.id)
+                        yield f"data: {event.model_dump_json()}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+        finally:
+            registry.unsubscribe(run_id, queue)
 
     return StreamingResponse(
         stream(), media_type="text/event-stream",
@@ -276,3 +292,60 @@ def run_triple_map(run_id: str):
     except KeyError as exc:
         raise HTTPException(404, "Run not found") from exc
     return triple_map.snapshot(run.final_triples)
+
+
+# The simple baseline deliberately has its own API namespace and persistence.
+# It reuses document ingestion but never enters the strict agentic harness.
+@app.get("/api/simple/documents")
+def list_simple_documents(workspace_id: str = "default"):
+    return list_documents(workspace_id)
+
+
+@app.post("/api/simple/documents")
+async def upload_simple_document(file: UploadFile = File(...), workspace_id: str = Form("default")):
+    return await upload_document(file, workspace_id)
+
+
+@app.post("/api/simple/research")
+async def create_simple_research(request: SimpleResearchRequest):
+    try:
+        run = simple_research.create(request)
+    except KeyError as exc:
+        raise HTTPException(404, f"Document not found: {exc.args[0]}") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _schedule_simple(run.id)
+    return run
+
+
+@app.get("/api/simple/runs")
+def list_simple_runs():
+    return simple_research.store.list()
+
+
+@app.get("/api/simple/runs/{run_id}")
+def get_simple_run(run_id: str):
+    try:
+        return simple_research.store.get(run_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Simple research run not found") from exc
+
+
+@app.post("/api/simple/runs/{run_id}/cancel")
+async def cancel_simple_run(run_id: str):
+    try:
+        run = simple_research.cancel(run_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Simple research run not found") from exc
+    task = _simple_tasks.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    return run
+
+
+@app.get("/api/simple/runs/{run_id}/triple-map")
+def simple_run_triple_map(run_id: str):
+    try:
+        return simple_research.triple_map(run_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Simple research run not found") from exc

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo } from 'react';
-import Graph from 'graphology';
+import { MultiDirectedGraph } from 'graphology';
 import { SigmaContainer, useLoadGraph } from '@react-sigma/core';
 import '@react-sigma/core/lib/style.css';
 import type { TripleMapSnapshot } from '@/lib/types';
@@ -10,7 +10,7 @@ function Loader({ snapshot }: { snapshot: TripleMapSnapshot }) {
   const load = useLoadGraph();
 
   const graph = useMemo(() => {
-    const g = new Graph({ multi: true, type: 'directed' });
+    const g = new MultiDirectedGraph();
 
     snapshot.nodes.forEach((n, i) =>
       g.addNode(n.id, {
@@ -49,13 +49,15 @@ export function TripleMapViewer({
     return (
       <div className="emptyState">
         No accepted triples are available for this run. This view is derived on
-        demand and is never persisted as an instance graph.
+        demand and is never persisted as an instance graph. Check EDC progress
+        for the precise stage that has not completed yet.
       </div>
     );
   }
 
   return (
     <SigmaContainer
+      graph={MultiDirectedGraph}
       className="sigma"
       settings={{ renderEdgeLabels: true, labelDensity: 0.08 }}
     >

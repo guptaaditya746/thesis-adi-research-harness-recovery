@@ -1,10 +1,34 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.models.domain import AgentTraceEvent
 from app.storage.registry import RunRegistry
 from app.telemetry.tracing import Telemetry, redact
+
+
+@dataclass
+class TraceLineage:
+    """Ephemeral execution links for one research run.
+
+    ArtifactStore remains the scientific provenance source. This only connects
+    observable runtime events such as a tool call and the specialist it starts.
+    """
+
+    tool_call_event_ids: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def remember_tool_call(self, tool_call_id: str | None, event_id: str, *, scope: str = "") -> None:
+        if tool_call_id:
+            self.tool_call_event_ids[(scope, tool_call_id)] = event_id
+
+    def parent_for_tool_call(self, tool_call_id: str | None, *, scope: str = "") -> str | None:
+        return self.tool_call_event_ids.get((scope, tool_call_id or ""))
+
+    def finish_tool_call(self, tool_call_id: str | None, *, scope: str = "") -> str | None:
+        if not tool_call_id:
+            return None
+        return self.tool_call_event_ids.pop((scope, tool_call_id), None)
 
 
 class TraceEmitter:
@@ -65,8 +89,17 @@ def _model_event_payload(event: Any, name: str) -> dict[str, Any]:
     return details
 
 
-def make_pydantic_event_handler(registry: RunRegistry, run_id: str, telemetry: Telemetry,
-                                actor_fallback: str = "agent", model_metadata: dict[str, Any] | None = None):
+def make_pydantic_event_handler(
+    registry: RunRegistry,
+    run_id: str,
+    telemetry: Telemetry,
+    actor_fallback: str = "agent",
+    model_metadata: dict[str, Any] | None = None,
+    *,
+    parent_event_id: str | None = None,
+    lineage: TraceLineage | None = None,
+    lineage_scope: str = "",
+):
     """Expose model/tool/retry boundaries without exposing ThinkingPart/hidden chain-of-thought."""
     emitter = TraceEmitter(registry, run_id, telemetry)
 
@@ -83,30 +116,37 @@ def make_pydantic_event_handler(registry: RunRegistry, run_id: str, telemetry: T
             tool_call_id = getattr(event, "tool_call_id", None) or getattr(part, "tool_call_id", None)
             if "toolcall" in low or "functiontoolcall" in low:
                 args = getattr(part, "args", None) or getattr(event, "args", None)
-                await emitter.emit(
+                emitted = await emitter.emit(
                     type="tool", actor=actor, action=str(tool_name or "tool_call"), title=f"Tool call: {tool_name or 'tool'}",
-                    status="started", payload={"event_class": name, "tool_call_id": tool_call_id, "arguments": args},
+                    status="started", parent_event_id=parent_event_id,
+                    payload={"event_class": name, "tool_call_id": tool_call_id, "arguments": args},
                 )
+                if lineage is not None:
+                    lineage.remember_tool_call(tool_call_id, emitted.id, scope=lineage_scope)
             elif "toolresult" in low or "functiontoolresult" in low:
                 content = getattr(part, "content", None) or getattr(event, "result", None)
                 await emitter.emit(
                     type="tool", actor=actor, action=str(tool_name or "tool_result"), title=f"Tool result: {tool_name or 'tool'}",
-                    status="completed", payload={"event_class": name, "tool_call_id": tool_call_id, "result": content},
+                    status="completed",
+                    parent_event_id=(lineage.finish_tool_call(tool_call_id, scope=lineage_scope) if lineage is not None else None) or parent_event_id,
+                    payload={"event_class": name, "tool_call_id": tool_call_id, "result": content},
                 )
             elif "retry" in low or "validationerror" in low:
                 await emitter.emit(
                     type="recovery", actor=actor, action="framework_repair_retry", title="Bounded framework repair",
-                    status="info", summary="PydanticAI requested a bounded tool/output repair.",
+                    status="info", summary="PydanticAI requested a bounded tool/output repair.", parent_event_id=parent_event_id,
                     payload={"event_class": name, "details": str(event)},
                 )
             elif "modelrequest" in low and "start" in low:
                 await emitter.emit(
                     type="model", actor=actor, action="model_request", title="Model request started", status="started",
+                    parent_event_id=parent_event_id,
                     payload={**(model_metadata or {}), **_model_event_payload(event, name)},
                 )
             elif "modelrequest" in low and ("end" in low or "complete" in low):
                 await emitter.emit(
                     type="model", actor=actor, action="model_request", title="Model request completed", status="completed",
+                    parent_event_id=parent_event_id,
                     payload={**(model_metadata or {}), **_model_event_payload(event, name)},
                 )
 

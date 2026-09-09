@@ -9,6 +9,7 @@ from urllib.parse import quote
 from rdflib import Graph, Literal, OWL, RDF, RDFS, URIRef
 
 from app.config import Settings
+from app.harness.contracts import OntologyArtifactIntegrityError
 from app.models.domain import OntologyElement, OntologyProposal, OntologyProposalStatus, SubOntologyArtifact
 
 DBLP = "https://dblp.org/rdf/schema#"
@@ -105,15 +106,12 @@ class OntologyService:
         for proposal in proposals:
             if proposal.status != OntologyProposalStatus.ACCEPTED_FOR_RUN:
                 continue
-            try:
-                self._validate_proposal(proposal, run_id)
-                self._apply_proposal(graph, proposal)
-            except ValueError as exc:
-                warnings.append(str(exc))
+            self._validate_proposal(proposal, run_id)
+            self._apply_proposal(graph, proposal)
         path.parent.mkdir(parents=True, exist_ok=True)
         graph.serialize(path, format="turtle")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        return SubOntologyArtifact(
+        artifact = SubOntologyArtifact(
             turtle_path=str(path), seed_schema_version=SCHEMA_VERSION, selected_elements=selected,
             dependency_uris=sorted(closure - set(selected_uris)), proposals=proposals,
             validation_warnings=warnings, content_sha256=digest,
@@ -124,6 +122,8 @@ class OntologyService:
             triple_count=len(graph),
             snapshot_builder_version=SNAPSHOT_BUILDER_VERSION,
         )
+        self._assert_accepted_proposals_materialized(artifact, proposals)
+        return artifact
 
     # Compatibility name for older callers.
     def build_subontology(self, selected_uris: list[str], proposals: list[OntologyProposal], path: Path, run_id: str) -> SubOntologyArtifact:
@@ -156,19 +156,44 @@ class OntologyService:
         expected_prefix = f"{RUN_OVERLAY_BASE}{run_id}/ontology#"
         if not proposal.uri.startswith(expected_prefix):
             raise ValueError(f"Run-local proposal URI must be inside {expected_prefix}")
-        if proposal.type == "property" and not proposal.definition.strip():
-            raise ValueError("Property proposal requires a definition")
+        # Pydantic owns basic shape validation. This method validates the
+        # run-local namespace and is also used before snapshot mutation.
+        if proposal.type == "class" and (proposal.domain is not None or proposal.range is not None):
+            raise ValueError("Class proposals cannot declare domain or range")
 
     @staticmethod
     def _apply_proposal(graph: Graph, proposal: OntologyProposal) -> None:
         uri = URIRef(proposal.uri)
-        graph.add((uri, RDF.type, RDF.Property if proposal.type == "property" else OWL.Class))
+        rdf_type = {
+            "class": OWL.Class,
+            "object_property": OWL.ObjectProperty,
+            "datatype_property": OWL.DatatypeProperty,
+        }[proposal.type]
+        graph.add((uri, RDF.type, rdf_type))
         graph.add((uri, RDFS.label, Literal(proposal.label)))
         graph.add((uri, RDFS.comment, Literal(proposal.definition)))
         if proposal.domain:
             graph.add((uri, RDFS.domain, URIRef(proposal.domain)))
         if proposal.range:
             graph.add((uri, RDFS.range, URIRef(proposal.range)))
+
+    def _assert_accepted_proposals_materialized(
+        self,
+        artifact: SubOntologyArtifact,
+        proposals: list[OntologyProposal],
+    ) -> None:
+        """Prove that an accepted proposal survived serialization with its type."""
+        relation_uris = {item.uri for item in self.relation_catalog(artifact)}
+        class_uris = {item.uri for item in self.class_catalog(artifact)}
+        for proposal in proposals:
+            if proposal.status != OntologyProposalStatus.ACCEPTED_FOR_RUN:
+                continue
+            catalog = class_uris if proposal.type == "class" else relation_uris
+            if proposal.uri not in catalog:
+                expected = "class_catalog" if proposal.type == "class" else "relation_catalog"
+                raise OntologyArtifactIntegrityError(
+                    f"Accepted {proposal.type} proposal {proposal.uri} is absent from {expected} after snapshot materialization."
+                )
 
     def _element(self, uri: URIRef, kind: str) -> OntologyElement:
         return self._element_from_graph(self.seed, uri, kind, "seed")

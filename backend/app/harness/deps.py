@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.config import Settings
 from app.services.edc import EDCService
@@ -16,6 +16,7 @@ from app.services.verification import TripleVerificationService
 from app.storage.artifacts import ArtifactStore
 from app.storage.registry import RunRegistry
 from app.telemetry.tracing import Telemetry
+from app.harness.events import TraceLineage
 
 
 @dataclass
@@ -38,6 +39,7 @@ class HarnessDeps:
     evaluation: EvaluationService
     completion: ScientificCompletionService
     telemetry: Telemetry
+    trace_lineage: TraceLineage = field(default_factory=TraceLineage)
 
     def ensure_not_cancelled(self) -> None:
         if self.registry.is_cancelled(self.run_id):

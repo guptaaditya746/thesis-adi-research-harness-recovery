@@ -22,6 +22,11 @@ from app.models.domain import (
 )
 
 
+def _tool_parent_event_id(ctx: RunContext[HarnessDeps]) -> str | None:
+    """Resolve the visible event for the currently executing director tool call."""
+    return ctx.deps.trace_lineage.parent_for_tool_call(ctx.tool_call_id, scope="research_director")
+
+
 def persist_retrieval_candidate_bundle(deps: HarnessDeps, query: str, spans: list[EvidenceSpan]):
     bundle = RetrievalCandidateBundle(
         query=query,
@@ -99,7 +104,8 @@ def register_research_tools(agent) -> None:
         ref = ctx.deps.artifacts.put("decision", decision, creator_agent_id="research_director", parent_artifact_ids=decision.artifact_ids)
         await TraceEmitter(ctx.deps.registry, ctx.deps.run_id, ctx.deps.telemetry).emit(
             type="decision", actor="research_director", action=decision.action, title="Research decision",
-            summary=decision.reason, artifact_id=ref.id, payload=decision.model_dump(mode="json"),
+            summary=decision.reason, artifact_id=ref.id, parent_event_id=_tool_parent_event_id(ctx),
+            payload=decision.model_dump(mode="json"),
         )
         return ref.model_dump(mode="json")
 
@@ -178,18 +184,30 @@ def register_research_tools(agent) -> None:
     async def spawn_specialist(ctx: RunContext[HarnessDeps], spec: AgentSpec) -> dict:
         """Create a specialist; missing scientific state returns a typed blocked task result."""
         ctx.deps.ensure_not_cancelled()
-        output = await AgentFactory(ctx.deps).run(spec)
+        output = await AgentFactory(ctx.deps).run(spec, parent_event_id=_tool_parent_event_id(ctx))
         return output.model_dump(mode="json")
 
     @agent.tool
     async def run_specialist_fanout(ctx: RunContext[HarnessDeps], specs: list[AgentSpec]) -> list[dict]:
-        """Dynamically fan out independent specialists; each receives isolated context/toolsets."""
+        """Run two or more independent, artifact-ready specialists concurrently.
+
+        Use this instead of sequential `spawn_specialist` calls when no specialist
+        needs an artifact produced by another in this batch. Each specialist is
+        isolated and receives only its own typed artifact IDs. Do not use it for a
+        dependent chain that requires the Director's judgment between results.
+        """
         ctx.deps.ensure_not_cancelled()
-        outputs = await AgentFactory(ctx.deps).run_fanout(specs)
+        outputs = await AgentFactory(ctx.deps).run_fanout(specs, parent_event_id=_tool_parent_event_id(ctx))
         return [x.model_dump(mode="json") for x in outputs]
 
     @agent.tool
     async def run_dynamic_workflow(ctx: RunContext[HarnessDeps], specs: list[AgentSpec], orchestration_instruction: str) -> dict:
+        """Coordinate a bounded, provenance-safe specialist crew in one tool call.
+
+        Workflow task strings may contain instructions and ArtifactStore IDs only.
+        Never transfer source evidence, ontology payloads, or EDC payloads through
+        script-generated task text; downstream work must explicitly read artifacts.
+        """
         if not specs:
             raise ValueError("Dynamic workflow requires at least one runtime-generated AgentSpec")
         ctx.deps.ensure_not_cancelled()
@@ -199,10 +217,10 @@ def register_research_tools(agent) -> None:
         except ScientificStateBlocked:
             # A workflow cannot begin with unmet scientific prerequisites. Return
             # the same typed blocked results as ordinary specialist delegation.
-            return {"mode": "host_fanout", "results": [x.model_dump(mode="json") for x in await factory.run_fanout(specs)]}
+            return {"mode": "host_fanout", "results": [x.model_dump(mode="json") for x in await factory.run_fanout(specs, parent_event_id=_tool_parent_event_id(ctx))]}
         if workflow is None:
             # Configured fallback preserves dynamic specialists without making DynamicWorkflow mandatory.
-            return {"mode": "host_fanout", "results": [x.model_dump(mode="json") for x in await factory.run_fanout(specs)]}
+            return {"mode": "host_fanout", "results": [x.model_dump(mode="json") for x in await factory.run_fanout(specs, parent_event_id=_tool_parent_event_id(ctx))]}
         spec_refs = [ctx.deps.artifacts.put(
             "agent_spec", s, label=f"Dynamic workflow specialist: {s.role}", creator_agent_id="research_director",
             parent_artifact_ids=s.input_artifact_ids,
@@ -210,7 +228,8 @@ def register_research_tools(agent) -> None:
         prompt = (
             f"Orchestration objective: {orchestration_instruction}\n\n"
             "Use run_workflow to orchestrate only the provided runtime-created specialists. They are isolated leaves; "
-            "fan out or chain them as useful, then return a concise SpecialistResult summarizing their results and artifact IDs."
+            "fan out or chain them as useful, then return a concise SpecialistResult summarizing their results and artifact IDs. "
+            "Pass only instructions and ArtifactStore IDs between workflow tasks; never pass scientific source, ontology, or EDC payloads."
         )
         workflow_agent = Agent(
             build_model(ctx.deps.settings, ModelProfile.BALANCED), output_type=SpecialistResult,
@@ -219,7 +238,12 @@ def register_research_tools(agent) -> None:
             model_settings={"temperature": ctx.deps.settings.llm_temperature, "max_tokens": ctx.deps.settings.llm_max_tokens},
         )
         result = await workflow_agent.run(
-            prompt, event_stream_handler=make_pydantic_event_handler(ctx.deps.registry, ctx.deps.run_id, ctx.deps.telemetry, "dynamic_workflow"),
+            prompt,
+            event_stream_handler=make_pydantic_event_handler(
+                ctx.deps.registry, ctx.deps.run_id, ctx.deps.telemetry, "dynamic_workflow",
+                parent_event_id=_tool_parent_event_id(ctx), lineage=ctx.deps.trace_lineage,
+                lineage_scope="dynamic_workflow",
+            ),
             usage_limits=UsageLimits(request_limit=max(3, ctx.deps.settings.max_subagent_calls + 3)),
             conversation_id=f"{ctx.deps.run_id}:dynamic_workflow",
         )
@@ -248,6 +272,7 @@ def register_research_tools(agent) -> None:
             action="completion_attempt_accepted" if attempt.accepted else "completion_attempt_rejected",
             title="Scientific completion accepted" if attempt.accepted else "Scientific completion rejected",
             status="completed" if attempt.accepted else "info", artifact_id=ref.id,
+            parent_event_id=_tool_parent_event_id(ctx),
             payload=attempt.model_dump(mode="json"),
         )
         return attempt.model_dump(mode="json")

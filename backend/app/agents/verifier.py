@@ -7,13 +7,20 @@ from app.services.verification import TripleVerificationService
 
 async def verify_triples_with_agent(settings, triples: list[CanonicalTriple], bundle: EvidenceBundle) -> list[VerifiedTriple]:
     checks = await TripleVerificationService(settings).verify(triples, bundle)
+    checks_by_triple_id = {check.triple_id: check for check in checks}
     by_id = {x.id: x for x in bundle.spans}
     output: list[VerifiedTriple] = []
-    for triple, check in zip(triples, checks):
+    for triple in triples:
+        check = checks_by_triple_id.get(triple.id)
         doc_ids = sorted({by_id[e].document_id for e in triple.evidence_ids if e in by_id})
-        status = "supported" if check.status == "accepted" else "unsupported" if check.status == "rejected" else "weakly_supported"
+        status = (
+            "supported" if check and check.status == "accepted"
+            else "unsupported" if check and check.status == "rejected"
+            else "weakly_supported"
+        )
         output.append(VerifiedTriple(
-            triple=triple, status=status, explanation=check.explanation,
+            triple=triple, status=status,
+            explanation=check.explanation if check else "Verifier returned no check for this triple.",
             provenance=ProvenanceRecord(
                 triple_id=triple.id, document_id=doc_ids[0] if len(doc_ids) == 1 else None,
                 document_ids=doc_ids, evidence_ids=triple.evidence_ids,

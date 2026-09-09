@@ -45,3 +45,24 @@ export type ResearchDataParts = {
   answer: {runId:string; answer:string};
 };
 export type ResearchUIMessage = UIMessage<never, ResearchDataParts>;
+
+export type SimpleCitation = {
+  evidence_id:string; document_id:string; page:number; quote:string;
+};
+export type SimpleTriple = {
+  id:string; subject:string; subject_type:string; predicate:string; predicate_key:string;
+  predicate_uri:string; object:string; object_type:string; evidence_ids:string[];
+};
+export type SimpleResearchResult = {
+  answer:string; citations:SimpleCitation[]; triples:SimpleTriple[]; limitations:string[];
+};
+export type SimpleResearchRun = {
+  id:string; question:string; document_ids:string[]; model:string; model_mode:'fast'|'default'|'reasoning'|'custom'; reasoning_effort?:'low'|'medium'|'high';
+  status:'queued'|'running'|'completed'|'failed'|'cancelled';
+  stage:'queued'|'retrieving'|'generating'|'validating'|'repairing'|'completed'|'failed'|'cancelled';
+  evidence:Array<{id:string;document_id:string;page:number;text:string;score?:number}>;
+  result?:SimpleResearchResult; timings_ms:Record<string,number>; model_calls:number;
+  execution_profile?:{retrieval_per_document:number;max_passages:number;passage_max_chars:number;requested_max_tokens:number;reasoning_effort?:'low'|'medium'|'high'};
+  model_request_diagnostics?:Array<{stage:'generation'|'repair';model:string;estimated_prompt_tokens:number;requested_max_tokens:number;context_window_tokens?:number;timeout_seconds:number;elapsed_ms?:number;outcome:'pending'|'completed'|'timed_out'|'failed';error_type?:string;finish_reason?:string;provider_prompt_tokens?:number;provider_completion_tokens?:number;visible_output_chars?:number;reasoning_content_chars?:number}>;
+  error?:string; created_at:string; updated_at:string;
+};

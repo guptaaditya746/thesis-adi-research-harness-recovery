@@ -36,7 +36,22 @@ class Settings(BaseSettings):
     model_extractor: str | None = None
     llm_temperature: float = 0.0
     llm_max_tokens: int = 4096
+    edc_canonicalization_max_tokens: int = 2048
     llm_output_retries: int = 3
+
+    # Direct OpenAI-SDK baseline. Independent from the agentic harness budgets.
+    simple_retrieval_per_document: int = 6
+    simple_max_passages: int = 12
+    simple_passage_max_chars: int = 3_000
+    simple_llm_max_tokens: int = 2_048
+    simple_full_llm_max_tokens: int = 32_768
+    # Result-first envelope for the slower reasoning model only.
+    simple_reasoning_retrieval_per_document: int = 4
+    simple_reasoning_max_passages: int = 4
+    simple_reasoning_passage_max_chars: int = 1_200
+    simple_reasoning_llm_max_tokens: int = 8_000
+    simple_reasoning_effort: Literal["low", "medium", "high"] = "low"
+    simple_request_timeout_seconds: float = 360.0
 
     # Optional, non-secret operator declarations for experiment reproducibility.
     llm_runtime_id: str | None = None
@@ -54,12 +69,23 @@ class Settings(BaseSettings):
     # Agentic harness budgets
     max_agent_steps: int = 28
     max_subagent_calls: int = 18
+    max_specialist_failures_per_task: int = 1
     max_run_seconds: int = 900
     max_evidence_spans: int = 24
     max_evidence_chars: int = 45_000
     max_tool_output_chars: int = 20_000
     context_warn_fraction: float = 0.82
+    # Retained for existing deployments; compaction now targets a fraction of
+    # the safe input budget rather than clearing at a second threshold.
     context_clear_fraction: float = 0.70
+    enable_context_management: bool = True
+    context_compact_target_fraction: float = 0.30
+    context_safety_margin_tokens: int = 2_048
+    context_summary_max_tokens: int = 1_024
+    context_summary_model: str | None = None
+    context_tool_result_max_chars: int = 8_000
+    context_clamp_part_chars: int = 12_000
+    context_keep_tool_pairs: int = 4
 
     # Harness capabilities
     enable_agent_shell: bool = True
@@ -109,8 +135,8 @@ class Settings(BaseSettings):
     enable_llm_eval: bool = False
 
     # Frontend/backend
-    next_public_api_base: str = "http://localhost:8000"
-    backend_internal_url: str = "http://127.0.0.1:8000"
+    next_public_api_base: str = "http://localhost:8100"
+    backend_internal_url: str = "http://127.0.0.1:8100"
 
     @computed_field
     @property
@@ -129,7 +155,7 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("documents", "runs", "workspaces", "harness_steps", "ontology_cache"):
+        for name in ("documents", "runs", "simple_runs", "workspaces", "harness_steps", "ontology_cache"):
             (self.data_dir / name).mkdir(parents=True, exist_ok=True)
 
 

@@ -15,6 +15,14 @@ def build_model(settings: Settings, profile: ModelProfile | str = ModelProfile.B
     )
 
 
+def build_named_model(settings: Settings, model_name: str) -> OpenAIChatModel:
+    """Build an OpenAI-compatible model without assigning it a research profile."""
+    return OpenAIChatModel(
+        model_name,
+        provider=OpenAIProvider(base_url=settings.litellm_api_base, api_key=settings.litellm_api_key),
+    )
+
+
 def model_metadata(settings: Settings, profile: ModelProfile | str, retry_number: int = 0) -> ModelCallMetadata:
     p = ModelProfile(profile)
     return ModelCallMetadata(

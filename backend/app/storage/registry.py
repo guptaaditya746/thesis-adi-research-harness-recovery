@@ -11,7 +11,7 @@ from app.models.domain import AgentTraceEvent, ExperimentRun, utc_now
 
 
 class RunRegistry:
-    """SQLite-backed run/event registry plus in-process SSE queues.
+    """SQLite-backed run/event registry plus in-process SSE subscriptions.
 
     SQLite is the authoritative durable index; run.json is retained as a human-readable
     sidecar/checkpoint for experiment reproducibility.
@@ -19,7 +19,7 @@ class RunRegistry:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.runs: dict[str, ExperimentRun] = {}
-        self.queues: dict[str, asyncio.Queue[AgentTraceEvent]] = {}
+        self.subscribers: dict[str, set[asyncio.Queue[AgentTraceEvent]]] = {}
         self.cancelled: set[str] = set()
         self._lock = threading.RLock()
         self.db_path = self._sqlite_path(settings.database_url)
@@ -47,7 +47,7 @@ class RunRegistry:
 
     def create(self, run: ExperimentRun) -> ExperimentRun:
         self.runs[run.id] = run
-        self.queues[run.id] = asyncio.Queue()
+        self.subscribers.setdefault(run.id, set())
         self.persist(run)
         return run
 
@@ -64,7 +64,7 @@ class RunRegistry:
         else:
             run = ExperimentRun.model_validate_json(row[0])
         self.runs[run_id] = run
-        self.queues.setdefault(run_id, asyncio.Queue())
+        self.subscribers.setdefault(run_id, set())
         return run
 
     def list(self, workspace_id: str | None = None) -> list[ExperimentRun]:
@@ -79,7 +79,7 @@ class RunRegistry:
         values = [ExperimentRun.model_validate_json(row[0]) for row in rows]
         for run in values:
             self.runs[run.id] = run
-            self.queues.setdefault(run.id, asyncio.Queue())
+            self.subscribers.setdefault(run.id, set())
         return values
 
     async def emit(self, event: AgentTraceEvent) -> None:
@@ -95,12 +95,36 @@ class RunRegistry:
                            (event.id, event.run_id, event.timestamp.isoformat(), event.model_dump_json()))
                 db.commit()
             self.persist(run)
-        await self.queues.setdefault(event.run_id, asyncio.Queue()).put(event)
+            # Every live SSE connection receives its own queue. `put_nowait`
+            # keeps one slow browser from blocking durable event persistence.
+            for queue in tuple(self.subscribers.setdefault(event.run_id, set())):
+                queue.put_nowait(event)
 
     def events(self, run_id: str) -> list[AgentTraceEvent]:
         with self._connect() as db:
             rows = db.execute("SELECT json FROM events WHERE run_id=? ORDER BY timestamp", (run_id,)).fetchall()
         return [AgentTraceEvent.model_validate_json(x[0]) for x in rows]
+
+    def subscribe(self, run_id: str) -> tuple[list[AgentTraceEvent], asyncio.Queue[AgentTraceEvent]]:
+        """Atomically register one live listener and snapshot durable history.
+
+        An event emitted after registration may appear both in the returned history
+        and the queue. The SSE endpoint deduplicates IDs, which is preferable to a
+        replay/live handoff gap that could lose an event.
+        """
+        with self._lock:
+            self.get(run_id)
+            queue: asyncio.Queue[AgentTraceEvent] = asyncio.Queue()
+            self.subscribers.setdefault(run_id, set()).add(queue)
+            with self._connect() as db:
+                rows = db.execute("SELECT json FROM events WHERE run_id=? ORDER BY timestamp", (run_id,)).fetchall()
+            return [AgentTraceEvent.model_validate_json(x[0]) for x in rows], queue
+
+    def unsubscribe(self, run_id: str, queue: asyncio.Queue[AgentTraceEvent]) -> None:
+        with self._lock:
+            subscribers = self.subscribers.get(run_id)
+            if subscribers is not None:
+                subscribers.discard(queue)
 
     def persist(self, run: ExperimentRun) -> None:
         with self._lock:

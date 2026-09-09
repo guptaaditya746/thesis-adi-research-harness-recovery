@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rdflib import BNode, Graph, Literal, Namespace, RDF, RDFS, URIRef
+from rdflib import BNode, Graph, Literal, Namespace, OWL, RDF, RDFS, URIRef
 from pyshacl import validate
 
 from app.models.domain import CanonicalTriple, SubOntologyArtifact, ValidationReport
@@ -17,26 +17,36 @@ class StructuralValidationService:
     product. Factual support remains a separate evidence-verification dimension.
     """
 
-    def build_ephemeral_graph(self, triples: list[CanonicalTriple]) -> Graph:
+    def build_ephemeral_graph(
+        self,
+        triples: list[CanonicalTriple],
+        *,
+        class_uris_by_name: dict[str, set[URIRef]] | None = None,
+    ) -> Graph:
         g = Graph()
         for triple in triples:
             subject = URIRef(self._entity_uri(triple.subject))
             predicate = URIRef(triple.predicate_uri) if triple.predicate_uri else URIRef(DATA + self._slug(triple.predicate))
-            if triple.subject_type and self._looks_uri(triple.subject_type):
-                g.add((subject, RDF.type, URIRef(triple.subject_type)))
+            subject_type = self._resolve_class_uri(triple.subject_type, class_uris_by_name or {})
+            if subject_type is not None:
+                g.add((subject, RDF.type, subject_type))
             if self._object_is_literal(triple):
                 obj = Literal(triple.object)
             else:
                 obj = URIRef(self._entity_uri(triple.object))
-                if triple.object_type and self._looks_uri(triple.object_type):
-                    g.add((obj, RDF.type, URIRef(triple.object_type)))
+                object_type = self._resolve_class_uri(triple.object_type, class_uris_by_name or {})
+                if object_type is not None:
+                    g.add((obj, RDF.type, object_type))
             g.add((subject, predicate, obj))
         return g
 
     def validate(self, triples: list[CanonicalTriple], ontology: SubOntologyArtifact) -> ValidationReport:
         try:
-            data_graph = self.build_ephemeral_graph(triples)
             ontology_graph = Graph().parse(ontology.turtle_path, format="turtle")
+            data_graph = self.build_ephemeral_graph(
+                triples,
+                class_uris_by_name=self._class_uris_by_name(ontology_graph),
+            )
             shapes = self._shapes_from_domains_ranges(ontology_graph)
             conforms, _, report_text = validate(
                 data_graph=data_graph,
@@ -92,6 +102,35 @@ class StructuralValidationService:
     @staticmethod
     def _looks_uri(value: str) -> bool:
         return value.startswith("http://") or value.startswith("https://")
+
+    @classmethod
+    def _class_uris_by_name(cls, graph: Graph) -> dict[str, set[URIRef]]:
+        """Index only classes materialized in this immutable ontology snapshot."""
+        names: dict[str, set[URIRef]] = {}
+        classes = set(graph.subjects(RDF.type, RDFS.Class)) | set(graph.subjects(RDF.type, OWL.Class))
+        for class_uri in classes:
+            if not isinstance(class_uri, URIRef):
+                continue
+            labels = [str(label) for label in graph.objects(class_uri, RDFS.label)]
+            labels.append(str(class_uri).rsplit("/", 1)[-1].rsplit("#", 1)[-1])
+            for label in labels:
+                names.setdefault(cls._type_key(label), set()).add(class_uri)
+        return names
+
+    @classmethod
+    def _resolve_class_uri(cls, value: str | None, class_uris_by_name: dict[str, set[URIRef]]) -> URIRef | None:
+        if not value:
+            return None
+        if cls._looks_uri(value):
+            return URIRef(value)
+        matches = class_uris_by_name.get(cls._type_key(value), set())
+        # Natural-language types are useful only when the snapshot makes the
+        # mapping unambiguous. Never mint a namespace URI from a model label.
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    @staticmethod
+    def _type_key(value: str) -> str:
+        return "".join(ch for ch in value.casefold() if ch.isalnum())
 
     @classmethod
     def _object_is_literal(cls, triple: CanonicalTriple) -> bool:

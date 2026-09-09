@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ class ArtifactStore:
         self.root = settings.data_dir / "runs" / run_id / "artifacts"
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "index.json"
+        self.index_lock_path = self.root / ".index.lock"
 
     def put(
         self,
@@ -52,25 +55,41 @@ class ArtifactStore:
             content=payload,
         )
         encoded = envelope.model_dump_json(indent=2)
-        if path.exists():
-            existing = ArtifactEnvelope.model_validate_json(path.read_text(encoding="utf-8"))
-            if existing.content_sha256 != content_hash:
-                raise FileExistsError(f"Artifact {aid} already exists with different content")
-        else:
-            self._atomic_write(path, encoded)
-        index = self._index()
-        index[aid] = {
-            "kind": kind,
-            "path": str(path),
-            "label": label,
-            "content_sha256": content_hash,
-            "creator_agent_id": creator_agent_id,
-            "parent_artifact_ids": parent_artifact_ids or [],
-            "schema_version": schema_version,
-            "created_at": envelope.created_at.isoformat(),
-        }
-        self._atomic_write(self.index_path, json.dumps(index, indent=2, ensure_ascii=False))
+        # Fan-out normally shares one asyncio loop, but ArtifactStore is also used
+        # by independent instances/processes. Protect the complete envelope/index
+        # transaction with an OS lock so a stale read-modify-write cannot drop an
+        # artifact from index.json.
+        with self._index_lock():
+            if path.exists():
+                existing = ArtifactEnvelope.model_validate_json(path.read_text(encoding="utf-8"))
+                if existing.content_sha256 != content_hash:
+                    raise FileExistsError(f"Artifact {aid} already exists with different content")
+            else:
+                self._atomic_write(path, encoded)
+            index = self._index()
+            index[aid] = {
+                "kind": kind,
+                "path": str(path),
+                "label": label,
+                "content_sha256": content_hash,
+                "creator_agent_id": creator_agent_id,
+                "parent_artifact_ids": parent_artifact_ids or [],
+                "schema_version": schema_version,
+                "created_at": envelope.created_at.isoformat(),
+            }
+            self._atomic_write(self.index_path, json.dumps(index, indent=2, ensure_ascii=False))
         return ArtifactRef(id=aid, kind=kind, path=str(path), label=label, content_sha256=content_hash)
+
+    @contextmanager
+    def _index_lock(self):
+        """Cross-thread/process advisory lock for one run's artifact index."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self.index_lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def get(self, artifact_id: str, *, envelope: bool = False) -> Any:
         item = self._index().get(artifact_id)

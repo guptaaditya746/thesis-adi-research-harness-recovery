@@ -10,7 +10,9 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.agents.model_factory import build_model
+from app.agents.routing import TaskModelRouter
 from app.config import Settings
+from app.services.ontogpt_extraction import OntoGPTExtractionService
 from app.models.domain import (
     CandidateTriple,
     CanonicalRelationCandidate,
@@ -21,6 +23,7 @@ from app.models.domain import (
     OntologyElement,
     OntologyProposal,
     RelationDefinition,
+    new_id,
 )
 
 
@@ -58,22 +61,30 @@ class EDCService:
     bounded LLM verification. The optional embedding ablation flag is intentionally
     not implemented in the base path.
     """
+    CANONICALIZATION_SHORTLIST_THRESHOLD = 0.28
+
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.ontogpt_extraction = OntoGPTExtractionService(settings)
+        router = TaskModelRouter()
         retries = {"tools": settings.llm_output_retries, "output": settings.llm_output_retries}
         self.extract_agent = Agent(
-            build_model(settings, ModelProfile.EXTRACTOR),
+            build_model(settings, router.profile_for_service("edc_extract", ModelProfile.EXTRACTOR)),
             output_type=ExtractionOutput,
             retries=retries,
             model_settings={"temperature": settings.llm_temperature, "max_tokens": settings.llm_max_tokens},
             instructions=(
-                "EDC Extract stage. Extract only factual subject-predicate-object triples directly supported by the "
-                "provided immutable EvidenceSpan records. Preserve the evidence IDs that support each triple. "
+                "EDC Extract stage. Extract evidence-backed propositions materially relevant to answering the research "
+                "question, including necessary supporting context. Do not extract unrelated facts merely because they occur "
+                "in the evidence. Preserve the evidence IDs that support each triple. When a proposition is about what the "
+                "source paper reports, claims, or acknowledges, use the paper/publication as subject and record author "
+                "attribution only in extraction_note. Supply subject_type/object_type when the evidence supports a class; do "
+                "not use a generic 'authors' subject for a publication-level claim. "
                 "Do not infer unsupported facts or use ontology relations as evidence. Keep predicates open/natural at this stage."
             ),
         )
         self.define_agent = Agent(
-            build_model(settings, ModelProfile.BALANCED),
+            build_model(settings, router.profile_for_service("edc_define", ModelProfile.BALANCED)),
             output_type=DefinitionOutput,
             retries=retries,
             model_settings={"temperature": settings.llm_temperature, "max_tokens": settings.llm_max_tokens},
@@ -83,12 +94,14 @@ class EDCService:
             ),
         )
         self.verify_agent = Agent(
-            build_model(settings, ModelProfile.BALANCED),
+            build_model(settings, router.profile_for_service("edc_canonicalize", ModelProfile.FAST)),
             output_type=CanonicalizationChoice,
             retries=retries,
-            model_settings={"temperature": settings.llm_temperature, "max_tokens": min(settings.llm_max_tokens, 1400)},
+            # One structured choice over a host-ranked shortlist, not an open-ended
+            # reasoning task. Keep this budget separate from broad extraction.
+            model_settings={"temperature": settings.llm_temperature, "max_tokens": min(settings.llm_max_tokens, settings.edc_canonicalization_max_tokens)},
             instructions=(
-                "EDC Canonicalize verification stage. Choose a relation ONLY from the supplied deterministic shortlist when "
+                "EDC Canonicalize verification stage. Return exactly one concise structured choice. Choose a relation ONLY from the supplied deterministic shortlist when "
                 "its meaning and subject/object direction match the open predicate in the evidence. Return selected_uri=null "
                 "when no candidate is semantically equivalent. Never invent a URI."
             ),
@@ -103,12 +116,18 @@ class EDCService:
     ) -> list[CandidateTriple]:
         if not bundle.spans:
             return []
+        return await self.ontogpt_extraction.extract(bundle, question=question)
+
         hints = "\n".join(
             f"- {r.label}: {r.description or ''} (domain={r.domain or '?'}, range={r.range or '?'})"
             for r in (schema_hints or [])[:20]
         ) or "(No schema hints supplied; keep predicates open.)"
         extraction = await self.extract_agent.run(
-            f"Research question (scope only): {question}\n\n"
+            f"Research question: {question}\n\n"
+            "Use the research question as the selection criterion: extract only propositions materially relevant to "
+            "answering it, including necessary supporting context. Do not extract unrelated facts merely because they occur.\n\n"
+            "For paper-level findings or limitations, represent the source paper/publication as subject (with subject_type=Publication "
+            "when supported), not a generic authors subject. Keep author attribution in extraction_note.\n\n"
             "Optional DBLP schema hints (orientation only; do not force these predicates):\n"
             f"{hints}\n\nEvidence:\n{self._evidence_prompt(bundle)}"
         )
@@ -117,7 +136,7 @@ class EDCService:
         for triple in extraction.output.triples:
             valid_ids = [eid for eid in triple.evidence_ids if eid in allowed_evidence_ids]
             if valid_ids:
-                out.append(triple.model_copy(update={"evidence_ids": valid_ids}))
+                out.append(triple.model_copy(update={"id": new_id("open"), "evidence_ids": valid_ids}))
         return out
 
     async def define(self, open_triples: list[CandidateTriple]) -> list[RelationDefinition]:
@@ -163,6 +182,19 @@ class EDCService:
             if proposal:
                 proposals.append(proposal)
             selected = next((r for r in relations if r.uri == decision.selected_uri), None) if decision.selected_uri else None
+            if selected and not self._relation_type_compatible(triple, selected):
+                decision = decision.model_copy(update={
+                    "selected_uri": None,
+                    "selected_label": None,
+                    "rejected_uris": sorted(set([*decision.rejected_uris, selected.uri])),
+                    "decision_reason": (
+                        f"{decision.decision_reason} Rejected before candidate persistence: "
+                        "the asserted subject/object types conflict with the selected relation domain/range."
+                    ),
+                    "outcome": "semantic_verifier_rejection",
+                })
+                decisions[-1] = decision
+                selected = None
             if not selected:
                 unresolved.append(triple.id)
                 continue
@@ -257,13 +289,15 @@ class EDCService:
                 open_triple_id=triple.id, open_predicate=triple.predicate, relation_definition=definition,
                 candidates=ranked, selected_uri=exact.uri, selected_label=exact.label,
                 rejected_uris=[x.uri for x in ranked if x.uri != exact.uri], decision_reason="Exact normalized label match.",
-                evidence_ids=triple.evidence_ids,
+                evidence_ids=triple.evidence_ids, outcome="successful_canonicalization",
             ), None
 
         selected_uri: str | None = None
         reason = "No deterministic candidate was strong enough to verify."
-        shortlist = [x for x in ranked if x.score >= 0.28]
+        shortlist = [x for x in ranked if x.score >= self.CANONICALIZATION_SHORTLIST_THRESHOLD]
+        outcome = "no_candidates" if not ranked else "candidates_below_shortlist_threshold"
         if shortlist:
+            outcome = "semantic_verifier_rejection"
             catalog = {r.uri: r for r in relations}
             prompt = [
                 f"Open triple: ({triple.subject}, {triple.predicate}, {triple.object})",
@@ -279,6 +313,7 @@ class EDCService:
             if result.output.selected_uri in {x.uri for x in shortlist}:
                 selected_uri = result.output.selected_uri
                 reason = result.output.reason
+                outcome = "successful_canonicalization"
             else:
                 reason = result.output.reason or reason
 
@@ -291,7 +326,7 @@ class EDCService:
             proposal = OntologyProposal(
                 proposed_by=producing_agent_id,
                 question=question,
-                type="property",
+                type="object_property",
                 uri=f"{RUN_OVERLAY_BASE}{run_id}/ontology#{slug}",
                 label=triple.predicate,
                 definition=definition,
@@ -310,6 +345,7 @@ class EDCService:
             decision_reason=reason,
             evidence_ids=triple.evidence_ids,
             ontology_proposal_id=proposal_id,
+            outcome=outcome,
         ), proposal
 
     @staticmethod
@@ -319,6 +355,14 @@ class EDCService:
         a = EDCService._norm(entity_type)
         b = EDCService._norm(ontology_type.rsplit("#", 1)[-1].rsplit("/", 1)[-1])
         return a == b or a in b or b in a
+
+    @classmethod
+    def _relation_type_compatible(cls, triple: CandidateTriple, relation: OntologyElement) -> bool:
+        """Reject only asserted incompatibilities; unknown types remain auditable."""
+        return (
+            cls._type_compatible(triple.subject_type, relation.domain) is not False
+            and cls._type_compatible(triple.object_type, relation.range) is not False
+        )
 
     @staticmethod
     def _evidence_prompt(bundle: EvidenceBundle) -> str:

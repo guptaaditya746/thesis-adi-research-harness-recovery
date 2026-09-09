@@ -1,0 +1,17 @@
+model_list:
+  # The research harness always calls LiteLLM on port 4000. LiteLLM selects
+  # the vLLM backend by alias, so the application never needs backend ports.
+  - model_name: qwen-chat
+    litellm_params:
+      model: openai/qwen-chat
+      api_base: os.environ/VLLM_DEEP_API_BASE
+      api_key: os.environ/VLLM_DEEP_API_KEY
+  - model_name: research-fast
+    litellm_params:
+      model: openai/research-fast
+      api_base: os.environ/VLLM_FAST_API_BASE
+      api_key: os.environ/VLLM_FAST_API_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false

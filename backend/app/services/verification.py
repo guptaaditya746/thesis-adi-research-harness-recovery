@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.agents.model_factory import build_model
+from app.agents.routing import TaskModelRouter
 from app.config import Settings
 from app.models.domain import (
     CanonicalTriple, EvidenceBundle, ModelProfile, SubOntologyArtifact, TripleVerification, VerificationDimensions, VerificationStatus,
@@ -27,8 +28,9 @@ class VerificationOutput(BaseModel):
 class TripleVerificationService:
     def __init__(self, settings: Settings):
         self.settings = settings
+        router = TaskModelRouter()
         self.agent = Agent(
-            build_model(settings, ModelProfile.CRITIC),
+            build_model(settings, router.profile_for_service("verification", ModelProfile.CRITIC)),
             output_type=VerificationOutput,
             retries={"tools": settings.llm_output_retries, "output": settings.llm_output_retries},
             model_settings={"temperature": settings.llm_temperature, "max_tokens": settings.llm_max_tokens},
@@ -50,14 +52,14 @@ class TripleVerificationService:
     ) -> list[TripleVerification]:
         span_by_id = {x.id: x for x in bundle.spans}
         eligible: list[CanonicalTriple] = []
-        prefailed: list[TripleVerification] = []
+        checks_by_triple_id: dict[str, TripleVerification] = {}
         for triple in triples:
             if not triple.evidence_ids or any(eid not in span_by_id for eid in triple.evidence_ids):
-                prefailed.append(self._failed_missing_evidence(triple, verifier_agent_id))
+                checks_by_triple_id[triple.id] = self._failed_missing_evidence(triple, verifier_agent_id)
             else:
                 eligible.append(triple)
         if not eligible:
-            return prefailed
+            return [checks_by_triple_id[triple.id] for triple in triples]
         relation_by_uri = {x.uri: x for x in (ontology.selected_elements if ontology else [])}
         chunks = []
         for t in eligible:
@@ -73,11 +75,12 @@ class TripleVerificationService:
             )
         result = await self.agent.run("\n\n---\n\n".join(chunks))
         by_id = {x.triple_id: x for x in result.output.judgements}
-        verified: list[TripleVerification] = prefailed
         for triple in eligible:
             j = by_id.get(triple.id)
             if not j:
-                verified.append(self._uncertain(triple, verifier_agent_id, "Verifier did not return a judgement for this triple."))
+                checks_by_triple_id[triple.id] = self._uncertain(
+                    triple, verifier_agent_id, "Verifier did not return a judgement for this triple."
+                )
                 continue
             dims = VerificationDimensions(
                 evidence_support=self._yn(j.evidence_support),
@@ -89,11 +92,13 @@ class TripleVerificationService:
                 entity_normalization_quality=self._entity(j.entity_normalization_quality),
             )
             status = self._status(dims)
-            verified.append(TripleVerification(
+            checks_by_triple_id[triple.id] = TripleVerification(
                 triple_id=triple.id, status=status, dimensions=dims, explanation=j.explanation,
                 evidence_ids=triple.evidence_ids, verifier_agent_id=verifier_agent_id,
-            ))
-        return verified
+            )
+        # Keep the public service result stable in caller input order. Callers must
+        # still use triple_id as the integrity key, rather than positional pairing.
+        return [checks_by_triple_id[triple.id] for triple in triples]
 
     @staticmethod
     def _status(d: VerificationDimensions) -> VerificationStatus:

@@ -5,9 +5,10 @@ import json
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -64,6 +65,28 @@ class ModelCallMetadata(BaseModel):
     retry_number: int = 0
     finish_reason: str | None = None
     request_id: str | None = None
+
+
+class ModelRoutingDecision(BaseModel):
+    """Auditable host selection of a model profile; never a scientific result."""
+
+    requested_profile: ModelProfile
+    effective_profile: ModelProfile
+    task_scope: SpecialistTaskScope
+    reason: str
+    requested_model: str
+    effective_model: str
+
+
+class FanoutExecution(BaseModel):
+    """Compact trajectory record for one host-side concurrent delegation batch."""
+
+    requested_specialist_ids: list[str]
+    dispatched_specialist_ids: list[str]
+    task_scopes: list[SpecialistTaskScope]
+    elapsed_ms: float
+    result_statuses: list[SpecialistStatus]
+    result_artifact_ids: list[str] = Field(default_factory=list)
 
 
 class ArtifactRef(BaseModel):
@@ -283,7 +306,9 @@ class QuestionAnalysis(BaseModel):
 
 
 class OntologyElement(BaseModel):
-    uri: str
+    # The host derives a run-local URI when omitted; persisted OntologyProposal
+    # artifacts always carry the resolved immutable URI.
+    uri: str | None = None
     label: str
     kind: Literal["class", "property"]
     description: str | None = None
@@ -301,11 +326,38 @@ class OntologyProposalStatus(StrEnum):
     DEPRECATED = "deprecated"
 
 
+class OntologyProposalInput(BaseModel):
+    """One model-supplied, run-local RDF resource before persistence.
+
+    A batch is a transport convenience only: every input still becomes its own
+    immutable ``ontology_proposal`` artifact.
+    """
+
+    proposal_type: Literal["class", "object_property", "datatype_property"]
+    label: str
+    definition: str
+    rationale: str
+    domain: str | None = None
+    range: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_resource_shape(self) -> OntologyProposalInput:
+        if not self.label.strip() or not self.definition.strip():
+            raise ValueError("Ontology proposals require non-empty label and definition.")
+        if self.proposal_type == "class" and (self.domain is not None or self.range is not None):
+            raise ValueError("Class proposals cannot declare domain or range.")
+        for name, value in (("domain", self.domain), ("range", self.range)):
+            if value is not None and not urlparse(value).scheme:
+                raise ValueError(f"Ontology proposal {name} must be an absolute URI when supplied.")
+        return self
+
+
 class OntologyProposal(BaseModel):
     proposal_id: str = Field(default_factory=lambda: new_id("ontprop"))
     proposed_by: str = "research_director"
     question: str
-    type: Literal["class", "property"]
+    type: Literal["class", "object_property", "datatype_property"]
     uri: str
     label: str
     definition: str
@@ -314,6 +366,22 @@ class OntologyProposal(BaseModel):
     rationale: str
     evidence_ids: list[str] = Field(default_factory=list)
     status: OntologyProposalStatus = OntologyProposalStatus.PROPOSED
+
+    @model_validator(mode="after")
+    def validate_resource_shape(self) -> OntologyProposal:
+        """A proposal is exactly one explicitly typed RDF resource.
+
+        Definitions remain ordinary prose: mentioning another ontology term must
+        never create or imply another RDF resource.
+        """
+        if not self.uri.strip() or not self.label.strip() or not self.definition.strip():
+            raise ValueError("Ontology proposals require non-empty uri, label, and definition.")
+        if self.type == "class" and (self.domain is not None or self.range is not None):
+            raise ValueError("Class proposals cannot declare domain or range.")
+        for name, value in (("domain", self.domain), ("range", self.range)):
+            if value is not None and not urlparse(value).scheme:
+                raise ValueError(f"Ontology proposal {name} must be an absolute URI when supplied.")
+        return self
 
 
 class SubOntologyArtifact(BaseModel):
@@ -385,6 +453,12 @@ class CanonicalizationDecision(BaseModel):
     decision_reason: str
     evidence_ids: list[str] = Field(default_factory=list)
     ontology_proposal_id: str | None = None
+    outcome: Literal[
+        "no_candidates",
+        "candidates_below_shortlist_threshold",
+        "semantic_verifier_rejection",
+        "successful_canonicalization",
+    ] = "no_candidates"
 
 
 class SupportType(StrEnum):
@@ -426,6 +500,13 @@ class EDCOpenTriples(BaseModel):
     edc_execution_id: str
     evidence_bundle_artifact_id: str
     triples: list[CandidateTriple] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _requires_unique_open_triple_ids(self):
+        ids = [triple.id for triple in self.triples]
+        if len(ids) != len(set(ids)):
+            raise ValueError("EDC open triple IDs must be unique within one execution")
+        return self
 
 
 class EDCRelationDefinitions(BaseModel):
@@ -673,6 +754,48 @@ class ScientificStateSnapshot(BaseModel):
     candidate_canonical_triples: bool = False
     verification_report: bool = False
     canonical_triples: bool = False
+
+
+class ContextArtifactReference(BaseModel):
+    """Payload-free scientific reference retained in Director working memory."""
+
+    id: str
+    kind: str
+    parent_artifact_ids: list[str] = Field(default_factory=list)
+
+
+class DirectorWorkingMemory(BaseModel):
+    """Bounded, non-authoritative context recovered after history compaction.
+
+    ArtifactStore remains the scientific source of truth. This model carries only
+    identifiers, factual artifact inventory, and a short operational summary.
+    """
+
+    schema_version: Literal["1"] = "1"
+    research_question: str
+    target_document_id: str
+    scientific_state: ScientificStateSnapshot
+    artifact_references: list[ContextArtifactReference] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    current_intent: str | None = None
+    caveats: list[str] = Field(default_factory=list)
+
+
+class ContextCompactionReceipt(BaseModel):
+    """Diagnostic receipt for a working-memory rewrite; never scientific evidence."""
+
+    trigger: Literal["context_budget"] = "context_budget"
+    strategy: Literal["clear_tool_results", "hybrid_typed_summary"]
+    input_tokens_before: int
+    input_tokens_after: int
+    safe_input_budget: int
+    target_tokens: int
+    messages_before: int
+    messages_after: int
+    retained_artifact_ids: list[str] = Field(default_factory=list)
+    summary_sha256: str | None = None
+    summary_fallback_used: bool = False
 
 
 class CompletionAttempt(BaseModel):

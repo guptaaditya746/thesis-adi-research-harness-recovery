@@ -1,0 +1,34 @@
+id: https://example.org/thesis/ontogpt/research
+name: thesis_research
+description: Evidence-bounded research triple extraction schema.
+prefixes:
+  linkml: https://w3id.org/linkml/
+default_prefix: thesis_research
+default_range: string
+imports:
+  - linkml:types
+classes:
+  ResearchExtraction:
+    tree_root: true
+    attributes:
+      triples:
+        description: Extract only atomic subject-predicate-object statements explicitly supported by the supplied passage and relevant to the research question.
+        multivalued: true
+        range: ResearchTriple
+  ResearchTriple:
+    attributes:
+      subject:
+        description: Exact concise source entity; use Paper or Publication for paper-level claims.
+        range: string
+      subject_type:
+        description: Supported type when explicit, such as Publication, Method, Dataset, Metric, Result, Claim, Limitation, or Entity.
+        range: string
+      predicate:
+        description: Open natural-language relation in subject-to-object direction.
+        range: string
+      object:
+        description: Exact concise entity, result, claim, or limitation explicitly stated in the passage.
+        range: string
+      object_type:
+        description: Supported type when explicit, such as Publication, Method, Dataset, Metric, Result, Claim, Limitation, or Entity.
+        range: string

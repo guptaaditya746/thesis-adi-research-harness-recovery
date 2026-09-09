@@ -2,10 +2,12 @@
 
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
+import Link from 'next/link';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
 import {
   Database,
+  Gauge,
   FileStack,
   History,
   Network,
@@ -18,6 +20,7 @@ import {
 import { AgentTrace } from './AgentTrace';
 import { ArtifactInspector } from './ArtifactInspector';
 import { DocumentManager } from './DocumentManager';
+import { EDCProgressPanel, ScientificStateStrip } from './ScientificProgress';
 
 import {
   deleteDocument,
@@ -77,6 +80,8 @@ export function ResearchConsole() {
 
   const [artifacts, setArtifacts] = useState<ArtifactMeta[]>([]);
   const [artifact, setArtifact] = useState<ArtifactEnvelope>();
+  const [edcArtifacts, setEdcArtifacts] = useState<ArtifactEnvelope[]>([]);
+  const [tripleMapMode, setTripleMapMode] = useState<'accepted' | 'edc'>('accepted');
 
   const transport = useMemo(
     () =>
@@ -127,11 +132,28 @@ export function ResearchConsole() {
   }
 
   async function refreshRun(id: string) {
-    const nextRun = await getRun(id);
+    const [nextRun, nextMap, nextArtifacts] = await Promise.all([
+      getRun(id),
+      getTripleMap(id),
+      listArtifacts(id),
+    ]);
+    const progressKinds = new Set([
+      'edc_open_triples',
+      'edc_relation_definitions',
+      'edc_canonicalization',
+      'edc_canonicalization_attempt',
+      'ontology_snapshot',
+      'candidate_canonical_triples',
+    ]);
+    const latestProgress = [...nextArtifacts]
+      .reverse()
+      .filter((item, index, rows) => progressKinds.has(item.kind) && rows.findIndex((candidate) => candidate.kind === item.kind) === index)
+      .map((item) => item.id);
 
     setRun(nextRun);
-    setMap(await getTripleMap(id));
-    setArtifacts(await listArtifacts(id));
+    setMap(nextMap);
+    setArtifacts(nextArtifacts);
+    setEdcArtifacts(await Promise.all(latestProgress.map((artifactId) => getArtifact(id, artifactId))));
   }
 
   useEffect(() => {
@@ -196,9 +218,7 @@ export function ResearchConsole() {
 
   async function openHistorical(nextRun: RunInfo) {
     setRunId(nextRun.id);
-    setRun(nextRun);
-    setMap(await getTripleMap(nextRun.id));
-    setArtifacts(await listArtifacts(nextRun.id));
+    await refreshRun(nextRun.id);
     setView('artifacts');
   }
 
@@ -221,6 +241,8 @@ export function ResearchConsole() {
     });
     setArtifacts([]);
     setArtifact(undefined);
+    setEdcArtifacts([]);
+    setTripleMapMode('accepted');
 
     await sendMessage({ text });
   }
@@ -280,6 +302,16 @@ export function ResearchConsole() {
 
         <div className="navGrow" />
 
+        <Link href="/simple" className="navDataLink">
+          <Gauge />
+          <span>Simple</span>
+        </Link>
+
+        <Link href="/run-data" className="navDataLink">
+          <Database />
+          <span>JSON data</span>
+        </Link>
+
         <button>
           <Settings2 />
           <span>Settings</span>
@@ -312,6 +344,7 @@ export function ResearchConsole() {
         {view === 'research' && (
           <div className="researchGrid">
             <section className="chatPane">
+              <ScientificStateStrip artifacts={artifacts} onArtifact={inspect} />
               <div className="contextBar">
                 <span>
                   {selected.length} paper
@@ -452,7 +485,7 @@ export function ResearchConsole() {
           <div className="singlePane graphPane">
             <div className="paneTitle">
               <div>
-                <b>Temporary run triple map</b>
+                <b>{tripleMapMode === 'accepted' ? 'Accepted triple map' : 'EDC progress'}</b>
 
                 <span>
                   {runId
@@ -460,9 +493,17 @@ export function ResearchConsole() {
                     : 'select or complete a run'}
                 </span>
               </div>
+              <div className="viewTabs" role="tablist" aria-label="Triple map views">
+                <button className={tripleMapMode === 'accepted' ? 'active' : ''} onClick={() => setTripleMapMode('accepted')}>Accepted triples</button>
+                <button className={tripleMapMode === 'edc' ? 'active' : ''} onClick={() => setTripleMapMode('edc')}>EDC progress</button>
+              </div>
             </div>
 
-            <TripleMapViewer snapshot={map} />
+            {tripleMapMode === 'accepted' ? (
+              <TripleMapViewer snapshot={map} />
+            ) : (
+              <EDCProgressPanel artifacts={edcArtifacts} onArtifact={inspect} />
+            )}
           </div>
         )}
 

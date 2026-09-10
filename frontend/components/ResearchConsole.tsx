@@ -321,11 +321,8 @@ export function ResearchConsole() {
       <main className="console">
         <header>
           <div>
-            <b>ADI Research Console</b>
-            <span>
-              dynamic specialists · lexical evidence retrieval · canonical
-              triples + provenance
-            </span>
+            <b>Scientific Literature Research Harness</b>
+            <span>Evidence-grounded literature analysis · fixed and agentic workflows</span>
           </div>
 
           <div className="runtime">

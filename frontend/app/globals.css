@@ -307,3 +307,15 @@ body {
 .simpleTripleGrid article b{display:flex;min-width:0;flex-direction:column;gap:3px}.simpleTripleGrid article b small{color:var(--simple-muted);font:8px ui-monospace,SFMono-Regular,Menlo,monospace}
 .simpleModelControls{display:flex;gap:14px;align-items:end}
 @media(max-width:900px){.simpleLayout{grid-template-columns:1fr}.simpleDocuments{border-right:0;border-bottom:1px solid var(--simple-line)}.simpleDocumentList{max-height:180px}.simpleHistory{display:none}.simpleTripleGrid{grid-template-columns:1fr}.simpleHeader{align-items:flex-start}.simpleMode{display:none}}@media(max-width:560px){.simpleWorkspace{padding:14px}.simpleHeader{padding:18px}.simpleStages b,.simpleStages>div>svg{display:none}.simpleCitationGrid{grid-template-columns:1fr}}
+/* High-contrast console header and research-state metrics */
+.console > header { background: #182b40; border-bottom-color: #45617b; }
+.console > header b { color: #ffffff; font-weight: 750; }
+.console > header span { color: #d9e7f3; font-weight: 500; }
+.runtime { color: #ffffff; font-weight: 700; }
+.runtime i { background: #63d391; box-shadow: 0 0 0 4px rgba(99, 211, 145, .18), 0 0 14px rgba(99, 211, 145, .55); }
+.scientificState { background: #ffffff; border-bottom-color: #cbd5df; }
+.scientificStateLabel { color: #465363; font-weight: 750; }
+.scientificMilestone { color: #5b6877; }
+.scientificMilestone.available { color: #173e62; background: #e7f3fc; border-color: #9fc8e5; }
+.scientificMilestone.missing { opacity: 1; color: #687585; background: #f1f4f7; border-color: #d7dee6; }
+.contextBar { color: #465363; background: #ffffff; border-bottom-color: #cbd5df; }

@@ -139,7 +139,7 @@ export function AgentTrace({ events, onArtifact }: { events: TraceEvent[]; onArt
 
   return (
     <div className="trace">
-      <div className="traceHead"><b>Live research trace</b><span>{events.length} observable actions</span></div>
+      <div className="traceHead"><b>Live research trace</b><span className="traceActionCount"><strong>{events.length}</strong><em>observable actions</em></span></div>
       <div className="traceList" role="tree">
         {events.length === 0 && <div className="traceEmpty">Ask a question. Director decisions, generated specialist tasks, model/tool boundaries, retries, recovery and artifacts will appear here. Hidden chain-of-thought is intentionally excluded.</div>}
         {roots.map((event) => (

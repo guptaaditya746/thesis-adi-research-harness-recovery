@@ -80,3 +80,30 @@ make benchmark-five ARGS="--document-id doc_123 --output data/benchmarks/paper.j
 The runner executes all five cases even if an individual case fails, then writes
 a JSON report containing run IDs, statuses, artifact/provenance coverage, latency,
 subagent calls, retries, invalid-reference failures, and model/tool usage.
+
+## Deterministic presentation example
+
+Create one successful, evidence-backed run for the existing UI without making a
+model call:
+
+```bash
+make demo-success ARGS="--document-id doc_448795ae1e2f4823"
+```
+
+Then start the backend and frontend and open `http://localhost:3000`. The newest
+run in **Experiment run history** contains six accepted triples, exact page-one
+evidence, ontology lineage, RDF/SHACL validation and a triple map. The question,
+answer and evaluation explicitly label this as a human-curated deterministic
+demonstration; it must not be reported as benchmark performance.
+
+## Related projects
+
+1. [Docling Graph](https://github.com/docling-project/docling-graph) — best overall match: documents/PDFs → validated knowledge graph, provenance, schema validation and JSON export.
+2. [Wikontic](https://github.com/screemix/Wikontic) — SPO extraction followed by ontology alignment and separate accepted/filtered triples.
+3. [KnowledgeGraphBuilder](https://github.com/DataScienceLabFHSWF/KnowledgeGraphBuilder) — ontology-guided extraction, source alignment, SHACL validation and resumable checkpoints.
+4. [LangExtract](https://github.com/google/langextract) — grounds every extracted triple to an exact source passage.
+5. [OSKGC](https://github.com/HeraclesWang/OSKGC) — a benchmark for measuring triple accuracy and schema conformity.
+6. [OntoGPT](https://github.com/monarch-initiative/ontogpt) — an extraction component already used by this system.
+7. [EDC](https://github.com/clear-nus/edc) — closely matches the Extract → Define → Canonicalize workflow, but is older.
+
+See [`docs/SIMILAR_GITHUB_PROJECTS.md`](docs/SIMILAR_GITHUB_PROJECTS.md) for the detailed comparison and recommendations.

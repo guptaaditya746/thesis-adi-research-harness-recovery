@@ -60,7 +60,15 @@ class TripleVerificationService:
                 eligible.append(triple)
         if not eligible:
             return [checks_by_triple_id[triple.id] for triple in triples]
-        relation_by_uri = {x.uri: x for x in (ontology.selected_elements if ontology else [])}
+        relation_descriptions = {
+            x.uri: x.description for x in (ontology.selected_elements if ontology else [])
+        }
+        if ontology:
+            relation_descriptions.update({
+                proposal.uri: proposal.definition
+                for proposal in ontology.proposals
+                if proposal.type in {"object_property", "datatype_property"}
+            })
         chunks = []
         for t in eligible:
             evidence = "\n\n".join(
@@ -70,7 +78,7 @@ class TripleVerificationService:
             chunks.append(
                 f"TRIPLE_ID={t.id}\nTRIPLE=({t.subject}, {t.predicate}, {t.object})\n"
                 f"PREDICATE_URI={t.predicate_uri or 'OPEN_RELATION'}\n"
-                f"ONTOLOGY_RELATION={relation_by_uri.get(t.predicate_uri).description if t.predicate_uri in relation_by_uri else 'unresolved'}\n"
+                f"ONTOLOGY_RELATION={relation_descriptions.get(t.predicate_uri, 'unresolved')}\n"
                 f"EVIDENCE:\n{evidence}"
             )
         result = await self.agent.run("\n\n---\n\n".join(chunks))

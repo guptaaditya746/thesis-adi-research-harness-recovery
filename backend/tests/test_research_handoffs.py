@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 
-from app.agents.factory import AgentFactory
+from app.agents.factory import AgentFactory, effective_tool_call_limit
 from app.agents.toolsets import _ontology_tools, persist_candidate_evidence_from_bundle, read_retrieval_candidate_bundle
 from app.harness.contracts import CorrectableToolInputError, validate_specialist_spec
 from app.harness.context_management import ResearchContextManager
@@ -343,6 +343,56 @@ def test_ontology_batch_tools_persist_independent_resources_and_decisions(settin
     assert len(store.list("ontology_acceptance_decision")) == 3
 
 
+def test_ontology_snapshot_rejects_proposal_artifact_ids_passed_as_selected_uris(settings):
+    """Replay the malformed tool call observed in the five-case benchmark."""
+    store = ArtifactStore(settings, "run_ontology_snapshot_handoff")
+    deps = SimpleNamespace(
+        settings=settings,
+        artifacts=store,
+        ontology=OntologyService(settings),
+        run_id="run_ontology_snapshot_handoff",
+        registry=SimpleNamespace(get=lambda _run_id: SimpleNamespace(question="What are the limitations?")),
+    )
+    toolset = _ontology_tools(deps, "ontology_agent")
+    created = toolset.tools["create_ontology_proposals"].function([
+        OntologyProposalInput(
+            proposal_type="object_property",
+            label="hasLimitation",
+            definition="Connects a publication to a reported limitation.",
+            rationale="Required by the research question.",
+        )
+    ])
+    proposal_ids = [ref["id"] for ref in created["proposal_refs"]]
+
+    with pytest.raises(CorrectableToolInputError, match="accepted_proposal_artifact_ids"):
+        toolset.tools["materialize_ontology_snapshot"].function(proposal_ids)
+
+    assert store.list("ontology_snapshot") == []
+
+
+def test_snapshot_materialization_accepts_proposals_supplied_in_acceptance_parameter(settings):
+    store = ArtifactStore(settings, "run_snapshot_acceptance")
+    deps = SimpleNamespace(
+        settings=settings, artifacts=store, ontology=OntologyService(settings),
+        run_id="run_snapshot_acceptance",
+        registry=SimpleNamespace(get=lambda _run_id: SimpleNamespace(question="What are the limitations?")),
+    )
+    toolset = _ontology_tools(deps, "ontology_agent")
+    created = toolset.tools["create_ontology_proposals"].function([
+        OntologyProposalInput(
+            proposal_type="object_property", label="reportsLimitation",
+            definition="Connects a paper to a reported limitation.", rationale="Required by evidence.",
+        )
+    ])
+    proposal_id = created["proposal_refs"][0]["id"]
+
+    result = toolset.tools["materialize_ontology_snapshot"].function([], [proposal_id])
+
+    assert result["snapshot"]["triple_count"] > 0
+    assert len(result["snapshot"]["accepted_proposal_artifact_ids"]) == 1
+    assert len(store.list("ontology_acceptance_decision")) == 1
+
+
 def test_ontology_snapshot_specialist_budget_is_feasible(settings):
     store = ArtifactStore(settings, "run_ontology_budget")
     deps = make_deps(settings, store)
@@ -357,6 +407,27 @@ def test_ontology_snapshot_specialist_budget_is_feasible(settings):
         deps,
         make_spec(task_scope="ontology_snapshot", required_capabilities=["ontology"], max_tool_calls=4),
     )
+
+
+def test_invalid_specialist_budget_returns_input_error_instead_of_killing_director(settings):
+    store = ArtifactStore(settings, "run_invalid_specialist_budget")
+    factory = AgentFactory.__new__(AgentFactory)
+    factory.deps = make_deps(settings, store)
+    factory.deps.ensure_not_cancelled = lambda: None
+
+    result = asyncio.run(factory.run(
+        make_spec(task_scope="ontology_snapshot", required_capabilities=["ontology"], max_tool_calls=3)
+    ))
+
+    assert result.task_status == "partial"
+    assert "max_tool_calls >= 4" in result.blocked_reason
+    assert len(store.list("specialist_input_error")) == 1
+
+
+def test_retrieval_specialists_get_a_viable_host_tool_budget():
+    assert effective_tool_call_limit(make_spec(task_scope="document_analysis", max_tool_calls=5)) == 12
+    assert effective_tool_call_limit(make_spec(task_scope="evidence_selection", max_tool_calls=3)) == 12
+    assert effective_tool_call_limit(make_spec(task_scope="other", max_tool_calls=5)) == 5
 
 
 def test_director_ontology_guidance_never_requests_one_proposal_for_many_resources():

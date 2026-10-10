@@ -26,6 +26,12 @@ from app.harness.events import TraceEmitter, make_pydantic_event_handler
 from app.models.domain import AgentSpec, ArtifactRef, FanoutExecution, ModelProfile, ModelRoutingDecision, RecoveryAction, SpecialistResult, stable_hash
 
 
+def effective_tool_call_limit(spec: AgentSpec) -> int:
+    """Keep retrieval specialists viable when a model underestimates their budget."""
+    minimum = 12 if spec.task_scope in {"document_analysis", "evidence_selection"} else 1
+    return max(minimum, spec.max_tool_calls)
+
+
 class AgentFactory:
     """Constructs isolated ephemeral PydanticAI specialists from model-generated AgentSpecs."""
     def __init__(self, deps: HarnessDeps):
@@ -37,6 +43,8 @@ class AgentFactory:
         self.deps.ensure_not_cancelled()
         try:
             validate_specialist_spec(self.deps, spec)
+        except CorrectableToolInputError as exc:
+            return self._blocked_result(spec, exc, status="partial")
         except ScientificStateBlocked as exc:
             return self._blocked_result(spec, exc)
         except (ArtifactNotFound, InvalidArtifactKind, ArtifactIntegrityError) as exc:
@@ -99,8 +107,11 @@ class AgentFactory:
                             parent_event_id=spawn_event.id, lineage=self.deps.trace_lineage, lineage_scope=spec.id,
                         ),
                         usage_limits=UsageLimits(
-                            request_limit=max(2, spec.max_tool_calls + self.deps.settings.llm_output_retries + 2),
-                            tool_calls_limit=max(1, spec.max_tool_calls),
+                            request_limit=max(
+                                2,
+                                effective_tool_call_limit(spec) + self.deps.settings.llm_output_retries + 2,
+                            ),
+                            tool_calls_limit=effective_tool_call_limit(spec),
                         ),
                         conversation_id=f"{self.deps.run_id}:{spec.id}",
                     )

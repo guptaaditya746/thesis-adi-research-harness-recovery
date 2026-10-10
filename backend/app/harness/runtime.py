@@ -17,7 +17,7 @@ from app.harness.capabilities import build_director_capabilities
 from app.harness.deps import HarnessDeps
 from app.harness.events import TraceEmitter, TraceLineage, make_pydantic_event_handler
 from app.models.domain import (
-    CanonicalTriple, ExperimentRun, FailureRecord, RejectedTriple, ResearchConclusion, ResearchState,
+    CanonicalTriple, EDCOpenTriples, ExperimentRun, FailureRecord, RejectedTriple, ResearchConclusion, ResearchState,
     RunRuntimeIdentity, stable_hash,
 )
 from app.harness.completion import ScientificCompletionService
@@ -301,7 +301,19 @@ class ResearchHarness:
         )
         artifacts.put("failure_record", record, label="Strict scientific completion failure", creator_agent_id="research_harness")
         self._mark_terminal(run_id, "failed", reason)
-        self._evaluate(self.registry.get(run_id), artifacts)
+        run = self.registry.get(run_id)
+        open_meta = artifacts.find_latest("edc_open_triples")
+        if open_meta:
+            try:
+                open_result = EDCOpenTriples.model_validate(artifacts.get(open_meta["id"]))
+                if open_result.triples:
+                    lines = ["Unverified candidate findings (canonicalization did not complete):"]
+                    lines.extend(f"- {t.subject} — {t.predicate} — {t.object}" for t in open_result.triples)
+                    run.final_answer = "\n".join(lines)
+            except Exception:
+                pass
+        self._evaluate(run, artifacts)
+        self.registry.persist(run)
 
     @staticmethod
     def _render_answer(triples: list[CanonicalTriple]) -> str:

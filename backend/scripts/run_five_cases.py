@@ -64,6 +64,7 @@ async def run_cases(args: argparse.Namespace) -> Path:
         "document_ids": selected_ids,
         "case_count": len(cases),
         "completed_count": sum(case["status"] == "completed" for case in cases),
+        "partial_result_count": sum(case["result_level"] == "unverified_open" for case in cases),
         "cases": cases,
     }
     output = args.output or (

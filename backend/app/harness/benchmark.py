@@ -23,6 +23,15 @@ def summarize_run(run: ExperimentRun, artifacts: ArtifactStore, elapsed_seconds:
     rows = artifacts.list()
     kinds = Counter(row["kind"] for row in rows)
     events = run.events
+    triple_meta = artifacts.find_latest("canonical_triples")
+    result_level = "verified"
+    if triple_meta is None:
+        triple_meta = artifacts.find_latest("edc_open_triples")
+        result_level = "unverified_open" if triple_meta else "none"
+    triples = []
+    if triple_meta:
+        payload = artifacts.get(triple_meta["id"])
+        triples = payload.get("triples", []) if result_level == "unverified_open" else payload
     return {
         "run_id": run.id,
         "question": run.question,
@@ -31,6 +40,10 @@ def summarize_run(run: ExperimentRun, artifacts: ArtifactStore, elapsed_seconds:
         "elapsed_seconds": round(elapsed_seconds, 3),
         "artifact_count": len(rows),
         "artifact_counts_by_kind": dict(sorted(kinds.items())),
+        "result_level": result_level,
+        "triple_count": len(triples),
+        "triples": triples,
+        "triple_artifact_id": triple_meta["id"] if triple_meta else None,
         "provenance": {
             "evidence_persisted": bool(kinds["evidence_bundle"]),
             "ontology_snapshot_persisted": bool(kinds["ontology_snapshot"]),

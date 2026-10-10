@@ -19,6 +19,7 @@ from app.models.domain import (
     OntologyElement,
     OntologyProposal,
     OntologyProposalStatus,
+    RelationDefinition,
 )
 from app.services.edc import CanonicalizationChoice, EDCService, ExtractionOutput
 from app.services.ontology import DBLP, OntologyService
@@ -362,6 +363,61 @@ def test_edc_pipeline_persists_all_phase_artifacts(settings, tmp_path: Path):
     assert result["triple_count"] == 1
     assert result["definition_count"] == 1
     assert set(result["phase_artifact_refs"]) == {"edc_open_triples", "edc_relation_definitions", "edc_canonicalization"}
+
+
+def test_edc_pipeline_auto_extends_snapshot_and_retries_unmatched_relations(settings, tmp_path: Path):
+    store = ArtifactStore(settings, "run_auto_extend")
+    ontology = OntologyService(settings)
+    evidence_ref = store.put("evidence_bundle", EvidenceBundle(spans=[]))
+    snapshot_ref = store.put(
+        "ontology_snapshot",
+        ontology.build_snapshot([], [], tmp_path / "empty.ttl", run_id="run_auto_extend"),
+    )
+    open_triple = CandidateTriple(
+        id="open_reported", subject="Paper", predicate="reported", object="A finding", evidence_ids=["ev_1"]
+    )
+    relation_proposal = OntologyProposal(
+        proposed_by="edc", question="What was found?", type="object_property",
+        uri=ontology.make_proposal_uri("run_auto_extend", "reported"), label="reported",
+        definition="The subject reports the finding in the object.", rationale="No active relation matched.",
+        evidence_ids=["ev_1"],
+    )
+
+    class FakeEdc:
+        calls = 0
+
+        async def extract(self, *_args, **_kwargs):
+            return [open_triple]
+
+        async def define(self, _triples):
+            return [RelationDefinition(relation="reported", definition=relation_proposal.definition)]
+
+        async def canonicalize(self, _triples, _definitions, relations, **kwargs):
+            self.calls += 1
+            matched = next((relation for relation in relations if relation.label == "reported"), None)
+            if matched is None:
+                return [], [], [relation_proposal], [open_triple.id]
+            return [], [CanonicalTriple(
+                subject=open_triple.subject, predicate=matched.label, object=open_triple.object,
+                predicate_uri=matched.uri, evidence_ids=open_triple.evidence_ids,
+                ontology_snapshot_id=kwargs["ontology_snapshot_id"], canonicalization="exact",
+            )], [], []
+
+    fake = FakeEdc()
+    deps = SimpleNamespace(
+        artifacts=store, ontology=ontology, edc=fake, run_id="run_auto_extend",
+        registry=SimpleNamespace(get=lambda _run_id: SimpleNamespace(question="What was found?")),
+    )
+
+    result = asyncio.run(
+        _edc_tools(deps, "edc").tools["run_edc_pipeline"].function(evidence_ref.id, snapshot_ref.id)
+    )
+
+    assert fake.calls == 2
+    assert result["status"] == "completed"
+    assert len(store.get(result["candidate_ref"]["id"])) == 1
+    assert result["auto_extension_snapshot_ref"]["id"]
+    assert len(store.list("ontology_acceptance_decision")) == 1
     assert result["candidate_ref"] is not None
     execution = store.get(result["pipeline_execution_ref"]["id"])
     assert execution["edc_execution_id"] == result["edc_execution_id"]

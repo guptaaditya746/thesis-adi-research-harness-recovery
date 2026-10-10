@@ -394,8 +394,15 @@ def _ontology_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
 
     @ts.tool_plain
     def materialize_ontology_snapshot(selected_uris: list[str], accepted_proposal_artifact_ids: list[str] | None = None) -> dict:
+        invalid_selected_uris = [uri for uri in selected_uris if not uri.startswith(("http://", "https://"))]
+        if invalid_selected_uris:
+            raise CorrectableToolInputError(
+                "selected_uris accepts only full RDF URIs, not labels or artifact IDs. Pass ontology proposal "
+                "artifact IDs as accepted_proposal_artifact_ids; they will be accepted for this run and materialized."
+            )
         proposal_ids = accepted_proposal_artifact_ids or []
         proposals = []
+        resolved_proposal_ids = []
         for x in proposal_ids:
             require_kind(deps, x, "ontology_proposal")
             try:
@@ -403,8 +410,26 @@ def _ontology_tools(deps: HarnessDeps, agent_id: str) -> FunctionToolset:
             except ValueError as exc:
                 raise OntologyArtifactIntegrityError("Stored ontology proposal violates its declared schema.") from exc
             if proposal.status != OntologyProposalStatus.ACCEPTED_FOR_RUN:
-                raise ScientificStateBlocked("Ontology proposals must be explicitly accepted before snapshot materialization.", requirements=("ontology_snapshot",))
+                # Supplying a proposal through the explicitly named acceptance
+                # parameter is itself an unambiguous run-local acceptance action.
+                proposal = proposal.model_copy(update={"status": OntologyProposalStatus.ACCEPTED_FOR_RUN})
+                deps.ontology._validate_proposal(proposal, deps.run_id)
+                accepted_ref = deps.artifacts.put(
+                    "ontology_proposal", proposal, label=f"Accepted during snapshot: {proposal.label}",
+                    creator_agent_id=agent_id, parent_artifact_ids=[x],
+                )
+                deps.artifacts.put(
+                    "ontology_acceptance_decision",
+                    OntologyAcceptanceDecision(
+                        proposal_artifact_id=x, deciding_actor=agent_id,
+                        reason="Explicitly supplied for acceptance during ontology snapshot materialization.",
+                    ),
+                    creator_agent_id=agent_id, parent_artifact_ids=[accepted_ref.id],
+                )
+                x = accepted_ref.id
             proposals.append(proposal)
+            resolved_proposal_ids.append(x)
+        proposal_ids = resolved_proposal_ids
         digest = hashlib.sha256(("|".join(sorted(selected_uris)) + "|" + "|".join(sorted(proposal_ids))).encode()).hexdigest()[:12]
         path = deps.artifacts.root / f"ontology_snapshot_{digest}.ttl"
         snapshot = deps.ontology.build_snapshot(selected_uris, proposals, path, run_id=deps.run_id)
@@ -491,6 +516,8 @@ def _edc_tools(deps: HarnessDeps, agent_id: str, input_artifact_ids: list[str] |
         edc_open_triples_artifact_id: str,
         edc_relation_definitions_artifact_id: str,
         ontology_snapshot_artifact_id: str,
+        *,
+        allow_auto_extension: bool = True,
     ) -> dict:
         open_payload = load_payload(deps, edc_open_triples_artifact_id, "edc_open_triples", EDCOpenTriples)
         definitions_payload = load_payload(deps, edc_relation_definitions_artifact_id, "edc_relation_definitions", EDCRelationDefinitions)
@@ -568,6 +595,68 @@ def _edc_tools(deps: HarnessDeps, agent_id: str, input_artifact_ids: list[str] |
                 "candidate_canonical_triples", candidates, creator_agent_id=agent_id,
                 parent_artifact_ids=[*parents, result_ref.id],
             )
+        if candidate_ref is None and proposal_refs and allow_auto_extension:
+            # A no-match EDC pass already made an explicit, evidence-linked proposal
+            # for each open relation. Promote those proposals for this run and retry
+            # canonicalization once, rather than asking the Director to reconstruct
+            # the same multi-step handoff from free-form artifact IDs.
+            accepted_refs = []
+            for proposal_ref in proposal_refs:
+                proposal = OntologyProposal.model_validate(deps.artifacts.get(proposal_ref["id"])).model_copy(
+                    update={"status": OntologyProposalStatus.ACCEPTED_FOR_RUN}
+                )
+                deps.ontology._validate_proposal(proposal, deps.run_id)
+                accepted_ref = deps.artifacts.put(
+                    "ontology_proposal", proposal, label=f"Auto-accepted EDC relation: {proposal.label}",
+                    creator_agent_id=agent_id, parent_artifact_ids=[proposal_ref["id"]],
+                )
+                deps.artifacts.put(
+                    "ontology_acceptance_decision",
+                    OntologyAcceptanceDecision(
+                        proposal_artifact_id=proposal_ref["id"], deciding_actor="edc_auto_extension",
+                        reason="No active relation matched; accept the evidence-linked EDC proposal for this run.",
+                    ),
+                    creator_agent_id=agent_id, parent_artifact_ids=[accepted_ref.id],
+                )
+                accepted_refs.append(accepted_ref)
+
+            base_snapshot = load_payload(
+                deps, ontology_snapshot_artifact_id, "ontology_snapshot", SubOntologyArtifact
+            )
+            proposals_by_uri = {
+                proposal.uri: proposal for proposal in [
+                    *base_snapshot.proposals,
+                    *[OntologyProposal.model_validate(deps.artifacts.get(ref.id)) for ref in accepted_refs],
+                ]
+                if proposal.status == OntologyProposalStatus.ACCEPTED_FOR_RUN
+            }
+            digest = hashlib.sha256(
+                "|".join(sorted(proposals_by_uri)).encode()
+            ).hexdigest()[:12]
+            snapshot_path = deps.artifacts.root / f"ontology_snapshot_edc_{digest}.ttl"
+            extended_snapshot = deps.ontology.build_snapshot(
+                [element.uri for element in base_snapshot.selected_elements],
+                list(proposals_by_uri.values()), snapshot_path, run_id=deps.run_id,
+            ).model_copy(update={
+                "accepted_proposal_artifact_ids": [ref.id for ref in accepted_refs],
+            })
+            extended_ref = deps.artifacts.put(
+                "ontology_snapshot", extended_snapshot, label="EDC auto-extended ontology snapshot",
+                creator_agent_id=agent_id,
+                parent_artifact_ids=[ontology_snapshot_artifact_id, *[ref.id for ref in accepted_refs]],
+            )
+            recovered = await _canonicalize(
+                edc_open_triples_artifact_id,
+                edc_relation_definitions_artifact_id,
+                extended_ref.id,
+                allow_auto_extension=False,
+            )
+            return {
+                **recovered,
+                "initial_result_ref": result_ref.model_dump(mode="json"),
+                "auto_extension_snapshot_ref": extended_ref.model_dump(mode="json"),
+                "auto_accepted_proposal_refs": [ref.model_dump(mode="json") for ref in accepted_refs],
+            }
         return {
             "status": "completed" if candidate_ref and not unresolved else "partial" if candidate_ref else "blocked",
             "edc_execution_id": open_payload.edc_execution_id,

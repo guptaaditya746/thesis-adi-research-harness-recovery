@@ -1,0 +1,29 @@
+{
+  "name": "thesis-adi-research-console",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/react": "^4.0.74",
+    "@react-sigma/core": "^5.0.6",
+    "ai": "^7.0.68",
+    "graphology": "^0.26.0",
+    "graphology-types": "^0.24.8",
+    "lucide-react": "^0.542.0",
+    "next": "^16.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "sigma": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

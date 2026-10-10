@@ -1,0 +1,21 @@
+'use client';
+import { useEffect, useMemo } from 'react';
+import Graph from 'graphology';
+import { SigmaContainer, useLoadGraph } from '@react-sigma/core';
+import '@react-sigma/core/lib/style.css';
+import type { TripleMapSnapshot } from '@/lib/types';
+
+function Loader({snapshot}:{snapshot:TripleMapSnapshot}){
+  const load=useLoadGraph();
+  const graph=useMemo(()=>{
+    const g=new Graph({multi:true,type:'directed'});
+    snapshot.nodes.forEach((n,i)=>g.addNode(n.id,{label:n.label??n.id,size:8+(i%5),x:Math.cos(i)*10+i%7,y:Math.sin(i)*10+(i%11)}));
+    snapshot.edges.forEach(e=>{if(g.hasNode(e.source)&&g.hasNode(e.target))g.addEdgeWithKey(e.id,e.source,e.target,{label:e.label??e.predicate??'',size:1.5});});
+    return g;
+  },[snapshot]);
+  useEffect(()=>{load(graph);},[graph,load]); return null;
+}
+export function GraphViewer({snapshot}:{snapshot:TripleMapSnapshot}){
+  if(!snapshot.nodes.length)return <div className="emptyState">The graph grows only when verified triples are committed.</div>;
+  return <SigmaContainer className="sigma" settings={{renderEdgeLabels:true,labelDensity:0.08}}><Loader snapshot={snapshot}/></SigmaContainer>;
+}

@@ -1,0 +1,13 @@
+model_list:
+  - model_name: research-deep
+    litellm_params:
+      model: openai/gpt-5.2
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: research-fast
+    litellm_params:
+      model: openai/gpt-5.2-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false

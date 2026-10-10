@@ -1,0 +1,25 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# runtime data
+backend/data/
+
+# frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# misc
+.DS_Store
+*.tsbuildinfo
+data/

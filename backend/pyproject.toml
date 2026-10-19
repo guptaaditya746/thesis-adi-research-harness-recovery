@@ -31,7 +31,7 @@ dependencies = [
   "langtrace-python-sdk>=3.7,<4",
   # Langtrace 3.8.x still imports pkg_resources during instrumentation.
   # Setuptools 82 removed that compatibility module.
-  "setuptools>=75,<82",
+  "setuptools>=75,<84",
   "importlib-metadata>=9.0.0",
   "ontogpt>=1.1.1",
 ]
